@@ -1,0 +1,29 @@
+{
+  "wifi": {
+    "ssid": "BIT-Web",
+    "connect_wait_seconds": 20
+  },
+  "portal": {
+    "service_url": "http://10.0.0.55",
+    "ac_id": "8"
+  },
+  "credentials": {
+    "username": "YOUR_CAMPUS_ACCOUNT",
+    "password": "YOUR_CAMPUS_PASSWORD"
+  },
+  "network_check": {
+    "probes": [
+      {
+        "url": "http://www.msftconnecttest.com/connecttest.txt",
+        "expected_text": "Microsoft Connect Test"
+      },
+      {
+        "url": "http://connectivitycheck.gstatic.com/generate_204",
+        "expected_status": 204
+      }
+    ],
+    "timeout_seconds": 8
+  },
+  "check_interval_seconds": 60,
+  "retry_interval_seconds": 10
+}
