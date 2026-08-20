@@ -27,6 +27,8 @@ APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "campusnet.log"
 LOG_RETENTION_DAYS = 30
+STANDARD_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+BIT_SRUN_BASE64_ALPHABET = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 
 
 def configure_logging() -> logging.Logger:
@@ -183,6 +185,14 @@ def srun_xencode(text: str, key: str) -> bytes:
     return b"".join(value.to_bytes(4, "little") for value in values)
 
 
+def srun_base64_encode(data: bytes, alphabet: str = BIT_SRUN_BASE64_ALPHABET) -> str:
+    """使用北理门户设置的自定义 Base64 字母表编码 SRun info。"""
+    if len(alphabet) != 64 or len(set(alphabet)) != 64:
+        raise ValueError("portal.base64_alphabet 必须包含 64 个不重复字符")
+    encoded = base64.b64encode(data).decode("ascii")
+    return encoded.translate(str.maketrans(STANDARD_BASE64_ALPHABET, alphabet))
+
+
 def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
     portal = config["portal"]
     credentials = config["credentials"]
@@ -198,7 +208,8 @@ def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
     token, ip = str(challenge["challenge"]), str(challenge["client_ip"])
     hmd5 = hmac.new(token.encode(), password.encode(), hashlib.md5).hexdigest()
     info_payload = json.dumps({"username": username, "password": password, "ip": ip, "acid": str(portal["ac_id"]), "enc_ver": "srun_bx1"}, separators=(",", ":"), ensure_ascii=False)
-    info = "{SRBX1}" + base64.b64encode(srun_xencode(info_payload, token)).decode("ascii")
+    alphabet = str(portal.get("base64_alphabet", BIT_SRUN_BASE64_ALPHABET))
+    info = "{SRBX1}" + srun_base64_encode(srun_xencode(info_payload, token), alphabet)
     checksum_source = "".join(token + item for item in (username, hmd5, str(portal["ac_id"]), ip, "200", "1", info))
     try:
         response = jsonp(
@@ -207,6 +218,8 @@ def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
                 "action": "login", "username": username, "password": "{MD5}" + hmd5,
                 "ac_id": portal["ac_id"], "ip": ip, "chksum": hashlib.sha1(checksum_source.encode()).hexdigest(),
                 "info": info, "n": 200, "type": 1, "os": "Windows 10", "name": "Windows",
+                "double_stack": int(portal.get("double_stack", 0)),
+                "ignore": int(portal.get("ignore", 2)),
             },
         )
     except PortalRequestError as error:
@@ -330,6 +343,7 @@ def main() -> int:
         normal_interval = max(10, int(config.get("check_interval_seconds", 60)))
         retry_interval = max(1, int(config.get("retry_interval_seconds", 10)))
         while True:
+            attempt_started = time.monotonic()
             try:
                 healthy = ensure_connected(config)
             except Exception as error:  # 保活程序不能因一次网络错误退出
@@ -337,8 +351,10 @@ def main() -> int:
                 healthy = False
             if args.once:
                 return 0 if healthy else 1
-            # 网络正常时低频检测；一旦失败，短间隔持续重试直至恢复。
-            time.sleep(normal_interval if healthy else retry_interval)
+            # 按每次尝试的开始时间计时，避免“检测耗时 + 重试间隔”把周期拉长。
+            interval = normal_interval if healthy else retry_interval
+            elapsed = time.monotonic() - attempt_started
+            time.sleep(max(0.0, interval - elapsed))
     except Exception as error:
         LOG.exception("程序无法启动：%s", error)
         return 1

@@ -5,7 +5,10 @@
   },
   "portal": {
     "service_url": "http://10.0.0.55",
-    "ac_id": "8"
+    "ac_id": "8",
+    "base64_alphabet": "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA",
+    "double_stack": 0,
+    "ignore": 2
   },
   "credentials": {
     "username": "YOUR_CAMPUS_ACCOUNT",
