@@ -8,6 +8,8 @@
 
 认证中的 `info` 字段使用北理门户配置的自定义 Base64 字母表；相关值可在 `config.json` 的 `portal.base64_alphabet` 中覆盖。
 
+如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 3 次中断连接，程序会自动断开并重新关联 Wi-Fi，再继续认证。该过程只使用 Windows 本地 Wi-Fi 配置和校园网内网，不依赖外网。
+
 ## 首次使用
 
 请确认 Windows 已至少手动连接过一次 `BIT-Web`，使系统保存了该 Wi-Fi 配置。

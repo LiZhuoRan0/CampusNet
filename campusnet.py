@@ -15,6 +15,8 @@ import subprocess
 import sys
 import time
 from ctypes import wintypes
+from dataclasses import dataclass
+from http.client import RemoteDisconnected
 from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,16 @@ NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 class PortalRequestError(RuntimeError):
     """校园网门户不可达或返回异常状态。"""
+
+
+class PortalTransportError(PortalRequestError):
+    """校园网门户连接被中断，可通过重新关联 Wi-Fi 尝试恢复。"""
+
+
+@dataclass(frozen=True)
+class ConnectionAttempt:
+    healthy: bool
+    portal_transport_failure: bool = False
 
 
 def acquire_single_instance() -> bool:
@@ -143,11 +155,16 @@ def jsonp(url: str, params: dict[str, Any]) -> dict[str, Any]:
     except HTTPError as error:
         raise PortalRequestError(f"校园网门户返回 HTTP {error.code}") from error
     except URLError as error:
-        raise PortalRequestError(f"无法访问校园网门户：{error.reason}") from error
+        raise PortalTransportError(f"无法访问校园网门户：{error.reason}") from error
+    except (RemoteDisconnected, ConnectionError, TimeoutError, OSError) as error:
+        raise PortalTransportError(f"校园网门户连接中断：{error}") from error
     start, end = raw.find("("), raw.rfind(")")
     if start < 0 or end <= start:
-        raise RuntimeError(f"门户返回格式异常：{raw[:200]}")
-    return json.loads(raw[start + 1 : end])
+        raise PortalRequestError(f"门户返回格式异常：{raw[:200]}")
+    try:
+        return json.loads(raw[start + 1 : end])
+    except json.JSONDecodeError as error:
+        raise PortalRequestError("门户返回了无效 JSON") from error
 
 
 def srun_xencode(text: str, key: str) -> bytes:
@@ -199,10 +216,7 @@ def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
     username = str(credentials["username"])
     password = unprotect_password(str(credentials["password_encrypted"]))
     base_url = str(portal["service_url"]).rstrip("/")
-    try:
-        challenge = jsonp(f"{base_url}/cgi-bin/get_challenge", {"username": username, "ip": ""})
-    except PortalRequestError as error:
-        return False, str(error)
+    challenge = jsonp(f"{base_url}/cgi-bin/get_challenge", {"username": username, "ip": ""})
     if challenge.get("error") != "ok":
         return False, str(challenge.get("error_msg") or challenge.get("error") or "获取 challenge 失败")
     token, ip = str(challenge["challenge"]), str(challenge["client_ip"])
@@ -211,19 +225,16 @@ def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
     alphabet = str(portal.get("base64_alphabet", BIT_SRUN_BASE64_ALPHABET))
     info = "{SRBX1}" + srun_base64_encode(srun_xencode(info_payload, token), alphabet)
     checksum_source = "".join(token + item for item in (username, hmd5, str(portal["ac_id"]), ip, "200", "1", info))
-    try:
-        response = jsonp(
-            f"{base_url}/cgi-bin/srun_portal",
-            {
-                "action": "login", "username": username, "password": "{MD5}" + hmd5,
-                "ac_id": portal["ac_id"], "ip": ip, "chksum": hashlib.sha1(checksum_source.encode()).hexdigest(),
-                "info": info, "n": 200, "type": 1, "os": "Windows 10", "name": "Windows",
-                "double_stack": int(portal.get("double_stack", 0)),
-                "ignore": int(portal.get("ignore", 2)),
-            },
-        )
-    except PortalRequestError as error:
-        return False, str(error)
+    response = jsonp(
+        f"{base_url}/cgi-bin/srun_portal",
+        {
+            "action": "login", "username": username, "password": "{MD5}" + hmd5,
+            "ac_id": portal["ac_id"], "ip": ip, "chksum": hashlib.sha1(checksum_source.encode()).hexdigest(),
+            "info": info, "n": 200, "type": 1, "os": "Windows 10", "name": "Windows",
+            "double_stack": int(portal.get("double_stack", 0)),
+            "ignore": int(portal.get("ignore", 2)),
+        },
+    )
     if response.get("error") == "ok":
         return True, str(response.get("ploy_msg") or "登录成功")
     return False, str(response.get("ploy_msg") or response.get("error_msg") or response.get("error") or "登录失败")
@@ -264,6 +275,24 @@ def connect_wifi(ssid: str) -> bool:
     return True
 
 
+def disconnect_wifi() -> bool:
+    """断开当前 Wi-Fi，使 Windows 重新与接入点关联。"""
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "disconnect"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.warning("断开 Wi-Fi 超时。")
+        return False
+    if result.returncode != 0:
+        LOG.warning("断开 Wi-Fi 失败：%s", result.stderr.strip() or result.stdout.strip())
+        return False
+    LOG.info("已请求断开当前 Wi-Fi。")
+    return True
+
+
 def internet_available(config: dict[str, Any]) -> bool:
     # 认证门户也可能返回 HTTP 200；因此必须同时核对预期的状态码或正文，不能只看请求是否成功。
     for probe in config["network_check"]["probes"]:
@@ -282,15 +311,21 @@ def internet_available(config: dict[str, Any]) -> bool:
     return False
 
 
-def ensure_connected(config: dict[str, Any]) -> bool:
+def ensure_connected(config: dict[str, Any], force_wifi_reconnect: bool = False) -> ConnectionAttempt:
     ssid = str(config["wifi"]["ssid"])
     active_ssid = current_ssid()
+
+    if force_wifi_reconnect and active_ssid == ssid:
+        LOG.warning("校园网门户连续连接失败，正在重新关联 Wi-Fi：%s。", ssid)
+        disconnect_wifi()
+        time.sleep(1)
+        active_ssid = None
 
     # 未连接任何 Wi-Fi 时，直接使用 Windows 本地保存的配置重连；不等待外网探测超时。
     if active_ssid is None:
         LOG.warning("当前未连接 Wi-Fi，开始连接 %s。", ssid)
         if not connect_wifi(ssid):
-            return False
+            return ConnectionAttempt(False)
         deadline = time.monotonic() + int(config["wifi"].get("connect_wait_seconds", 20))
         while time.monotonic() < deadline:
             if current_ssid() == ssid:
@@ -298,16 +333,16 @@ def ensure_connected(config: dict[str, Any]) -> bool:
             time.sleep(2)
         if current_ssid() != ssid:
             LOG.warning("等待连接 %s 超时。", ssid)
-            return False
+            return ConnectionAttempt(False)
 
     # 若用户正在使用其他且可正常联网的 Wi-Fi，不抢占连接；其余情况切换到 BIT-Web。
     elif active_ssid != ssid:
         if internet_available(config):
             LOG.info("当前连接 %s，网络正常。", active_ssid)
-            return True
+            return ConnectionAttempt(True)
         LOG.warning("当前连接 %s 但网络不可用，开始连接 %s。", active_ssid, ssid)
         if not connect_wifi(ssid):
-            return False
+            return ConnectionAttempt(False)
         deadline = time.monotonic() + int(config["wifi"].get("connect_wait_seconds", 20))
         while time.monotonic() < deadline:
             if current_ssid() == ssid:
@@ -315,20 +350,27 @@ def ensure_connected(config: dict[str, Any]) -> bool:
             time.sleep(2)
         if current_ssid() != ssid:
             LOG.warning("等待连接 %s 超时。", ssid)
-            return False
+            return ConnectionAttempt(False)
 
     if internet_available(config):
         LOG.info("网络正常。")
-        return True
+        return ConnectionAttempt(True)
 
     # 已连接时只访问校园网内网门户；因此外网断开也可完成认证。
     LOG.warning("检测到网络不可用，正在进行校园网认证。")
-    success, message = srun_login(config)
+    try:
+        success, message = srun_login(config)
+    except PortalTransportError as error:
+        LOG.warning("校园网门户连接失败：%s", error)
+        return ConnectionAttempt(False, portal_transport_failure=True)
+    except PortalRequestError as error:
+        LOG.warning("校园网门户请求失败：%s", error)
+        return ConnectionAttempt(False)
     LOG.info("认证%s：%s", "成功" if success else "失败", message)
     if not success:
-        return False
+        return ConnectionAttempt(False)
     time.sleep(3)
-    return internet_available(config)
+    return ConnectionAttempt(internet_available(config))
 
 
 def main() -> int:
@@ -342,13 +384,23 @@ def main() -> int:
         config = load_config()
         normal_interval = max(10, int(config.get("check_interval_seconds", 60)))
         retry_interval = max(1, int(config.get("retry_interval_seconds", 10)))
+        reconnect_threshold = max(1, int(config["wifi"].get("reconnect_after_portal_failures", 3)))
+        portal_transport_failures = 0
         while True:
             attempt_started = time.monotonic()
+            force_wifi_reconnect = portal_transport_failures >= reconnect_threshold
+            if force_wifi_reconnect:
+                portal_transport_failures = 0
             try:
-                healthy = ensure_connected(config)
+                attempt = ensure_connected(config, force_wifi_reconnect=force_wifi_reconnect)
             except Exception as error:  # 保活程序不能因一次网络错误退出
                 LOG.exception("本次检测出错：%s", error)
-                healthy = False
+                attempt = ConnectionAttempt(False)
+            healthy = attempt.healthy
+            if attempt.portal_transport_failure:
+                portal_transport_failures += 1
+            else:
+                portal_transport_failures = 0
             if args.once:
                 return 0 if healthy else 1
             # 按每次尝试的开始时间计时，避免“检测耗时 + 重试间隔”把周期拉长。

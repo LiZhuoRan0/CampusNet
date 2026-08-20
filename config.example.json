@@ -1,7 +1,8 @@
 {
   "wifi": {
     "ssid": "BIT-Web",
-    "connect_wait_seconds": 20
+    "connect_wait_seconds": 20,
+    "reconnect_after_portal_failures": 3
   },
   "portal": {
     "service_url": "http://10.0.0.55",
