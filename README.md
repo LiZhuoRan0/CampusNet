@@ -6,6 +6,8 @@
 2. 按北京理工大学深澜（SRun）门户的 challenge 加密流程登录；
 3. 重新检查网络；若仍不可用，每 10 秒重试，直至恢复。
 
+认证中的 `info` 字段使用北理门户配置的自定义 Base64 字母表；相关值可在 `config.json` 的 `portal.base64_alphabet` 中覆盖。
+
 ## 首次使用
 
 请确认 Windows 已至少手动连接过一次 `BIT-Web`，使系统保存了该 Wi-Fi 配置。
@@ -63,7 +65,7 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
 
 ## 代码逻辑
 
-程序正常时每 60 秒检测一次；检测失败后改为每 10 秒重试，直至网络恢复。核心逻辑如下：
+程序正常时每 60 秒检测一次；检测失败后按每次尝试的开始时间约每 10 秒重试，直至网络恢复。核心逻辑如下：
 
 ```text
 检测外网是否真的可访问
