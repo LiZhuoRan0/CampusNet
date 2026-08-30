@@ -73,6 +73,15 @@ class ConnectionAttempt:
     portal_transport_failure: bool = False
 
 
+@dataclass(frozen=True)
+class WifiStatus:
+    """Windows WLAN 接口的实际关联状态，而不只是 connect 命令是否返回成功。"""
+
+    interface_name: str | None
+    ssid: str | None
+    connected: bool
+
+
 def acquire_single_instance() -> bool:
     """防止手动启动和 Windows 启动项同时创建多个保活进程。"""
     global SINGLE_INSTANCE_MUTEX
@@ -240,7 +249,13 @@ def srun_login(config: dict[str, Any]) -> tuple[bool, str]:
     return False, str(response.get("ploy_msg") or response.get("error_msg") or response.get("error") or "登录失败")
 
 
-def current_ssid() -> str | None:
+def wifi_status() -> WifiStatus:
+    """读取 Windows 报告的 WLAN 连接状态。
+
+    ``netsh wlan connect`` 只表示系统接受了请求。恢复流程必须以这里的
+    ``connected + SSID`` 为准，否则 Wi-Fi 尚在关联或 DHCP 尚未就绪时会过早
+    发起门户认证。
+    """
     try:
         result = subprocess.run(
             ["netsh", "wlan", "show", "interfaces"],
@@ -249,12 +264,26 @@ def current_ssid() -> str | None:
         )
     except subprocess.TimeoutExpired:
         LOG.warning("查询 Wi-Fi 状态超时。")
-        return None
+        return WifiStatus(None, None, False)
+    interface_name: str | None = None
+    ssid: str | None = None
+    state: str | None = None
     for line in result.stdout.splitlines():
-        match = re.match(r"^\s*SSID\s*:\s*(.*?)\s*$", line)
-        if match:
-            return match.group(1) or None
-    return None
+        if match := re.match(r"^\s*(?:Name|名称)\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
+            interface_name = match.group(1) or None
+        elif match := re.match(r"^\s*(?:State|状态)\s*:\s*(.*?)\s*$", line, flags=re.IGNORECASE):
+            state = match.group(1).strip().lower()
+        elif match := re.match(r"^\s*SSID\s*:\s*(.*?)\s*$", line):
+            ssid = match.group(1) or None
+    # Windows 中文界面的“已连接”和英文的“connected”均能覆盖；SSID 存在是
+    # 兼容其他系统语言的额外依据。
+    connected = state in {"connected", "已连接"} or (ssid is not None and state is None)
+    return WifiStatus(interface_name, ssid, connected)
+
+
+def current_ssid() -> str | None:
+    status = wifi_status()
+    return status.ssid if status.connected else None
 
 
 def connect_wifi(ssid: str) -> bool:
@@ -293,6 +322,95 @@ def disconnect_wifi() -> bool:
     return True
 
 
+def wait_for_wifi(ssid: str, wait_seconds: int) -> WifiStatus | None:
+    """等待实际关联到目标 SSID；成功时返回接口名以供后续 DHCP 操作使用。"""
+    deadline = time.monotonic() + max(1, wait_seconds)
+    last_status = WifiStatus(None, None, False)
+    while time.monotonic() < deadline:
+        last_status = wifi_status()
+        if last_status.connected and last_status.ssid == ssid:
+            LOG.info("已确认连接 Wi-Fi：%s（接口：%s）。", ssid, last_status.interface_name or "未知")
+            return last_status
+        time.sleep(2)
+    LOG.warning(
+        "等待 Wi-Fi %s 完成关联超时（当前 SSID：%s，状态：%s）。",
+        ssid,
+        last_status.ssid or "无",
+        "已连接" if last_status.connected else "未连接",
+    )
+    return None
+
+
+def renew_dhcp_lease(interface_name: str | None) -> bool:
+    """重新向校园网 DHCP 获取地址，不依赖外网或浏览器。"""
+    if not interface_name:
+        LOG.warning("无法确定 Wi-Fi 接口名称，跳过 DHCP 续租。")
+        return False
+    try:
+        result = subprocess.run(
+            ["ipconfig", "/renew", interface_name],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=35,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.warning("Wi-Fi DHCP 续租超时（接口：%s）。", interface_name)
+        return False
+    if result.returncode != 0:
+        LOG.warning("Wi-Fi DHCP 续租失败（接口：%s）：%s", interface_name, result.stderr.strip() or result.stdout.strip())
+        return False
+    LOG.info("已请求 Wi-Fi DHCP 续租（接口：%s）。", interface_name)
+    return True
+
+
+def reset_wifi_adapter(interface_name: str | None) -> bool:
+    """最后手段：禁用再启用无线接口。
+
+    某些 Windows 策略要求管理员权限；失败时只记录并继续后续重连，不弹出 UAC
+    窗口、不终止守护进程。
+    """
+    if not interface_name:
+        LOG.warning("无法确定 Wi-Fi 接口名称，跳过无线适配器重置。")
+        return False
+    command_prefix = ["netsh", "interface", "set", "interface", f"name={interface_name}"]
+    try:
+        disabled = subprocess.run(
+            [*command_prefix, "admin=DISABLED"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
+            creationflags=NO_WINDOW,
+        )
+        if disabled.returncode != 0:
+            LOG.warning("无线适配器重置未获执行（接口：%s）：%s", interface_name, disabled.stderr.strip() or disabled.stdout.strip())
+            return False
+        LOG.warning("已禁用无线适配器，正在重新启用：%s。", interface_name)
+        time.sleep(3)
+        enabled = subprocess.run(
+            [*command_prefix, "admin=ENABLED"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=15,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.warning("无线适配器重置超时（接口：%s）。", interface_name)
+        return False
+    if enabled.returncode != 0:
+        LOG.warning("重新启用无线适配器失败（接口：%s）：%s", interface_name, enabled.stderr.strip() or enabled.stdout.strip())
+        return False
+    LOG.info("已重新启用无线适配器：%s。", interface_name)
+    return True
+
+
+def wifi_recovery_cooldown(config: dict[str, Any], recovery_count: int) -> int:
+    """物理 Wi-Fi 恢复采用指数退避；门户认证本身仍按 retry_interval 重试。"""
+    wifi = config["wifi"]
+    base = max(10, int(wifi.get("wifi_reconnect_cooldown_seconds", 30)))
+    maximum = max(base, int(wifi.get("max_wifi_reconnect_cooldown_seconds", 300)))
+    return min(maximum, base * (2 ** max(0, recovery_count - 1)))
+
+
 def internet_available(config: dict[str, Any]) -> bool:
     # 认证门户也可能返回 HTTP 200；因此必须同时核对预期的状态码或正文，不能只看请求是否成功。
     for probe in config["network_check"]["probes"]:
@@ -311,14 +429,24 @@ def internet_available(config: dict[str, Any]) -> bool:
     return False
 
 
-def ensure_connected(config: dict[str, Any], force_wifi_reconnect: bool = False) -> ConnectionAttempt:
+def ensure_connected(
+    config: dict[str, Any],
+    force_wifi_reconnect: bool = False,
+    renew_dhcp: bool = False,
+    reset_adapter: bool = False,
+) -> ConnectionAttempt:
     ssid = str(config["wifi"]["ssid"])
-    active_ssid = current_ssid()
+    status = wifi_status()
+    active_ssid = status.ssid if status.connected else None
 
     if force_wifi_reconnect and active_ssid == ssid:
-        LOG.warning("校园网门户连续连接失败，正在重新关联 Wi-Fi：%s。", ssid)
-        disconnect_wifi()
-        time.sleep(1)
+        if reset_adapter:
+            LOG.warning("校园网门户长期不可达，正在重置无线适配器后重新关联 Wi-Fi：%s。", ssid)
+            reset_wifi_adapter(status.interface_name)
+        else:
+            LOG.warning("校园网门户连续连接失败，正在重新关联 Wi-Fi：%s。", ssid)
+            disconnect_wifi()
+            time.sleep(1)
         active_ssid = None
 
     # 未连接任何 Wi-Fi 时，直接使用 Windows 本地保存的配置重连；不等待外网探测超时。
@@ -326,13 +454,8 @@ def ensure_connected(config: dict[str, Any], force_wifi_reconnect: bool = False)
         LOG.warning("当前未连接 Wi-Fi，开始连接 %s。", ssid)
         if not connect_wifi(ssid):
             return ConnectionAttempt(False)
-        deadline = time.monotonic() + int(config["wifi"].get("connect_wait_seconds", 20))
-        while time.monotonic() < deadline:
-            if current_ssid() == ssid:
-                break
-            time.sleep(2)
-        if current_ssid() != ssid:
-            LOG.warning("等待连接 %s 超时。", ssid)
+        status = wait_for_wifi(ssid, int(config["wifi"].get("connect_wait_seconds", 20)))
+        if status is None:
             return ConnectionAttempt(False)
 
     # 若用户正在使用其他且可正常联网的 Wi-Fi，不抢占连接；其余情况切换到 BIT-Web。
@@ -343,13 +466,16 @@ def ensure_connected(config: dict[str, Any], force_wifi_reconnect: bool = False)
         LOG.warning("当前连接 %s 但网络不可用，开始连接 %s。", active_ssid, ssid)
         if not connect_wifi(ssid):
             return ConnectionAttempt(False)
-        deadline = time.monotonic() + int(config["wifi"].get("connect_wait_seconds", 20))
-        while time.monotonic() < deadline:
-            if current_ssid() == ssid:
-                break
-            time.sleep(2)
-        if current_ssid() != ssid:
-            LOG.warning("等待连接 %s 超时。", ssid)
+        status = wait_for_wifi(ssid, int(config["wifi"].get("connect_wait_seconds", 20)))
+        if status is None:
+            return ConnectionAttempt(False)
+
+    # 在多轮“已关联但门户断开”后刷新 DHCP 租约。这对应手动断开/重连通常
+    # 会触发的地址更新，且只访问本地 DHCP，不需要外网。
+    if renew_dhcp:
+        renew_dhcp_lease(status.interface_name)
+        status = wait_for_wifi(ssid, int(config["wifi"].get("connect_wait_seconds", 20)))
+        if status is None:
             return ConnectionAttempt(False)
 
     if internet_available(config):
@@ -386,21 +512,45 @@ def main() -> int:
         retry_interval = max(1, int(config.get("retry_interval_seconds", 10)))
         reconnect_threshold = max(1, int(config["wifi"].get("reconnect_after_portal_failures", 3)))
         portal_transport_failures = 0
+        wifi_recovery_count = 0
+        next_wifi_recovery_at = 0.0
         while True:
             attempt_started = time.monotonic()
-            force_wifi_reconnect = portal_transport_failures >= reconnect_threshold
-            if force_wifi_reconnect:
-                portal_transport_failures = 0
+            force_wifi_reconnect = (
+                portal_transport_failures >= reconnect_threshold and attempt_started >= next_wifi_recovery_at
+            )
+            recovery_number = wifi_recovery_count + 1 if force_wifi_reconnect else 0
+            renew_dhcp = force_wifi_reconnect and recovery_number >= max(
+                1, int(config["wifi"].get("dhcp_renew_after_wifi_recoveries", 2))
+            )
+            reset_adapter = force_wifi_reconnect and recovery_number >= max(
+                1, int(config["wifi"].get("adapter_reset_after_wifi_recoveries", 5))
+            )
             try:
-                attempt = ensure_connected(config, force_wifi_reconnect=force_wifi_reconnect)
+                attempt = ensure_connected(
+                    config,
+                    force_wifi_reconnect=force_wifi_reconnect,
+                    renew_dhcp=renew_dhcp,
+                    reset_adapter=reset_adapter,
+                )
             except Exception as error:  # 保活程序不能因一次网络错误退出
                 LOG.exception("本次检测出错：%s", error)
                 attempt = ConnectionAttempt(False)
             healthy = attempt.healthy
-            if attempt.portal_transport_failure:
-                portal_transport_failures += 1
-            else:
+            if healthy:
                 portal_transport_failures = 0
+                wifi_recovery_count = 0
+                next_wifi_recovery_at = 0.0
+            elif attempt.portal_transport_failure:
+                portal_transport_failures += 1
+            if force_wifi_reconnect:
+                wifi_recovery_count += 1
+                cooldown = wifi_recovery_cooldown(config, wifi_recovery_count)
+                next_wifi_recovery_at = time.monotonic() + cooldown
+                # 已实际执行恢复动作后重新累计连续门户失败次数；在冷却期内仍
+                # 每 10 秒认证，但不反复断开 Wi-Fi。
+                portal_transport_failures = 0
+                LOG.info("下一次 Wi-Fi 物理恢复最早将在 %s 秒后执行。", cooldown)
             if args.once:
                 return 0 if healthy else 1
             # 按每次尝试的开始时间计时，避免“检测耗时 + 重试间隔”把周期拉长。

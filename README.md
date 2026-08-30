@@ -8,7 +8,13 @@
 
 认证中的 `info` 字段使用北理门户配置的自定义 Base64 字母表；相关值可在 `config.json` 的 `portal.base64_alphabet` 中覆盖。
 
-如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 3 次中断连接，程序会自动断开并重新关联 Wi-Fi，再继续认证。该过程只使用 Windows 本地 Wi-Fi 配置和校园网内网，不依赖外网。
+如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 3 次中断连接，程序会自动进行分层恢复，并继续认证。该过程只使用 Windows 本地 Wi-Fi 配置、DHCP 和校园网内网，不依赖外网：
+
+1. 确认 Windows 实际已关联到 `BIT-Web`（不是只看连接命令是否提交成功）；
+2. 断开并重新关联已保存的 Wi-Fi 配置；
+3. 第二轮 Wi-Fi 恢复起，重新获取 DHCP 地址；
+4. 长期失败时，尝试无弹窗地重置无线适配器；若 Windows 策略不允许普通用户重置，程序会记录失败并继续其他恢复步骤，不会弹窗或退出；
+5. Wi-Fi 的物理重连采用 30 秒、60 秒、120 秒、最多 300 秒的退避，避免校园网门户故障时反复断网；认证请求本身仍按 10 秒间隔继续。
 
 ## 首次使用
 
@@ -79,6 +85,10 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
             ├─ 检查当前 Wi‑Fi 是否为 BIT-Web
             │     └─ 不是 → 执行 Windows 的 netsh 命令连接 BIT-Web
             │
+            ├─ 等待 Windows 确认已实际关联 BIT-Web
+            │
+            ├─ 多轮失败时续租 DHCP；长期失败时尝试重置无线适配器
+            │
             ├─ 已连接 BIT-Web 后，向校园网认证服务器请求 challenge
             │
             ├─ 用账号、密码和 challenge 按 SRun 规则生成加密登录参数
@@ -104,5 +114,12 @@ netsh wlan connect name=BIT-Web
 这要求 Windows 已经保存了 `BIT-Web` 的 Wi‑Fi 配置。认证成功或失败、连接失败等情况都会写入 `campusnet.log`。
 
 `netsh wlan connect` 使用的是本机已保存的 Wi-Fi 配置，而认证接口位于校园网内网 `10.0.0.55`；两者均不依赖外网可用。
+
+`wifi` 中的恢复参数可以按需调整；通常无需修改：
+
+- `reconnect_after_portal_failures`：连续几次门户传输失败后启动一次 Wi-Fi 物理恢复，默认 3。
+- `wifi_reconnect_cooldown_seconds` / `max_wifi_reconnect_cooldown_seconds`：物理恢复的初始与最大退避时间，默认 30 / 300 秒。
+- `dhcp_renew_after_wifi_recoveries`：第几次物理恢复起续租 DHCP，默认 2。
+- `adapter_reset_after_wifi_recoveries`：第几次物理恢复起尝试重置无线适配器，默认 5；若系统拒绝权限，会自动跳过。
 
 若电脑未连接任何 Wi-Fi，程序会跳过外网探测，立即执行本地 `netsh` 命令连接 `BIT-Web`。若正连接其他且能正常联网的 Wi-Fi，则不会抢占该连接。

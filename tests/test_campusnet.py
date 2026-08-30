@@ -37,10 +37,12 @@ class SRunEncodingTests(unittest.TestCase):
 
     def test_forced_reconnect_resets_wifi_before_checking_network(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
         with (
-            patch("campusnet.current_ssid", return_value="BIT-Web"),
+            patch("campusnet.wifi_status", return_value=connected),
             patch("campusnet.disconnect_wifi", return_value=True) as disconnect,
             patch("campusnet.connect_wifi", return_value=True) as connect,
+            patch("campusnet.wait_for_wifi", return_value=connected),
             patch("campusnet.internet_available", return_value=True),
             patch("campusnet.time.sleep"),
             patch.object(campusnet.LOG, "warning"),
@@ -51,6 +53,50 @@ class SRunEncodingTests(unittest.TestCase):
         self.assertTrue(result.healthy)
         disconnect.assert_called_once_with()
         connect.assert_called_once_with("BIT-Web")
+
+    def test_wait_for_wifi_requires_connected_state_and_matching_ssid(self) -> None:
+        statuses = [
+            campusnet.WifiStatus("WLAN 2", "BIT-Web", False),
+            campusnet.WifiStatus("WLAN 2", "other", True),
+            campusnet.WifiStatus("WLAN 2", "BIT-Web", True),
+        ]
+        with (
+            patch("campusnet.wifi_status", side_effect=statuses),
+            patch("campusnet.time.monotonic", side_effect=[0, 0, 1, 1, 2]),
+            patch("campusnet.time.sleep"),
+            patch.object(campusnet.LOG, "info"),
+        ):
+            status = campusnet.wait_for_wifi("BIT-Web", 10)
+        self.assertEqual(status, statuses[-1])
+
+    def test_recovery_cooldown_uses_bounded_exponential_backoff(self) -> None:
+        config = {
+            "wifi": {
+                "wifi_reconnect_cooldown_seconds": 30,
+                "max_wifi_reconnect_cooldown_seconds": 300,
+            }
+        }
+        self.assertEqual(campusnet.wifi_recovery_cooldown(config, 1), 30)
+        self.assertEqual(campusnet.wifi_recovery_cooldown(config, 2), 60)
+        self.assertEqual(campusnet.wifi_recovery_cooldown(config, 5), 300)
+
+    def test_forced_reconnect_can_renew_dhcp_after_association(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        with (
+            patch("campusnet.wifi_status", return_value=connected),
+            patch("campusnet.disconnect_wifi", return_value=True),
+            patch("campusnet.connect_wifi", return_value=True),
+            patch("campusnet.wait_for_wifi", return_value=connected),
+            patch("campusnet.renew_dhcp_lease", return_value=True) as renew,
+            patch("campusnet.internet_available", return_value=True),
+            patch("campusnet.time.sleep"),
+            patch.object(campusnet.LOG, "warning"),
+            patch.object(campusnet.LOG, "info"),
+        ):
+            result = campusnet.ensure_connected(config, force_wifi_reconnect=True, renew_dhcp=True)
+        self.assertTrue(result.healthy)
+        renew.assert_called_once_with("WLAN 2")
 
 
 if __name__ == "__main__":
