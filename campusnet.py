@@ -57,10 +57,6 @@ def configure_logging() -> logging.Logger:
 LOG = configure_logging()
 SINGLE_INSTANCE_MUTEX: int | None = None
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-WLAN_INTF_OPCODE_RADIO_STATE = 4
-WLAN_RADIO_STATE_OFF = 0
-WLAN_RADIO_STATE_ON = 1
-WLAN_MAX_PHY_INDEX = 64
 
 
 class PortalRequestError(RuntimeError):
@@ -84,46 +80,6 @@ class WifiStatus:
     interface_name: str | None
     ssid: str | None
     connected: bool
-
-
-class GUID(ctypes.Structure):
-    _fields_ = [
-        ("Data1", wintypes.DWORD),
-        ("Data2", wintypes.WORD),
-        ("Data3", wintypes.WORD),
-        ("Data4", ctypes.c_ubyte * 8),
-    ]
-
-
-class WLAN_INTERFACE_INFO(ctypes.Structure):
-    _fields_ = [
-        ("InterfaceGuid", GUID),
-        ("strInterfaceDescription", ctypes.c_wchar * 256),
-        ("isState", wintypes.DWORD),
-    ]
-
-
-class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
-    _fields_ = [
-        ("dwNumberOfItems", wintypes.DWORD),
-        ("dwIndex", wintypes.DWORD),
-        ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
-    ]
-
-
-class WLAN_PHY_RADIO_STATE(ctypes.Structure):
-    _fields_ = [
-        ("dwPhyIndex", wintypes.DWORD),
-        ("dot11SoftwareRadioState", wintypes.DWORD),
-        ("dot11HardwareRadioState", wintypes.DWORD),
-    ]
-
-
-class WLAN_RADIO_STATE(ctypes.Structure):
-    _fields_ = [
-        ("dwNumberOfPhys", wintypes.DWORD),
-        ("PhyRadioState", WLAN_PHY_RADIO_STATE * WLAN_MAX_PHY_INDEX),
-    ]
 
 
 def acquire_single_instance() -> bool:
@@ -330,142 +286,63 @@ def current_ssid() -> str | None:
     return status.ssid if status.connected else None
 
 
-def _wlan_api() -> Any:
-    """配置 Windows WLAN API 的 ctypes 签名。"""
-    wlanapi = ctypes.WinDLL("wlanapi", use_last_error=True)
-    wlanapi.WlanOpenHandle.argtypes = (
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(wintypes.HANDLE),
-    )
-    wlanapi.WlanOpenHandle.restype = wintypes.DWORD
-    wlanapi.WlanCloseHandle.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
-    wlanapi.WlanCloseHandle.restype = wintypes.DWORD
-    wlanapi.WlanEnumInterfaces.argtypes = (
-        wintypes.HANDLE,
-        ctypes.c_void_p,
-        ctypes.POINTER(ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)),
-    )
-    wlanapi.WlanEnumInterfaces.restype = wintypes.DWORD
-    wlanapi.WlanQueryInterface.argtypes = (
-        wintypes.HANDLE,
-        ctypes.POINTER(GUID),
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.POINTER(wintypes.DWORD),
-        ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(wintypes.DWORD),
-    )
-    wlanapi.WlanQueryInterface.restype = wintypes.DWORD
-    wlanapi.WlanSetInterface.argtypes = (
-        wintypes.HANDLE,
-        ctypes.POINTER(GUID),
-        wintypes.DWORD,
-        wintypes.DWORD,
-        ctypes.c_void_p,
-        ctypes.c_void_p,
-    )
-    wlanapi.WlanSetInterface.restype = wintypes.DWORD
-    wlanapi.WlanFreeMemory.argtypes = (ctypes.c_void_p,)
-    wlanapi.WlanFreeMemory.restype = None
-    return wlanapi
+ENABLE_WIFI_RADIO_SCRIPT = r"""
+$ErrorActionPreference = 'Stop'
+Add-Type -AssemblyName System.Runtime.WindowsRuntime
+[Windows.Devices.Radios.Radio,Windows.System.Devices,ContentType=WindowsRuntime] | Out-Null
+$asTask = [System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
+    $_.Name -eq 'AsTask' -and $_.IsGenericMethodDefinition -and
+    $_.GetGenericArguments().Count -eq 1 -and $_.GetParameters().Count -eq 1 -and
+    $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
+} | Select-Object -First 1
+$radiosOperation = [Windows.Devices.Radios.Radio]::GetRadiosAsync()
+$radios = $asTask.MakeGenericMethod([System.Collections.Generic.IReadOnlyList[Windows.Devices.Radios.Radio]]).Invoke(
+    $null, @($radiosOperation)
+).GetAwaiter().GetResult()
+$wifi = $radios | Where-Object { $_.Kind.ToString() -eq 'WiFi' } | Select-Object -First 1
+if ($null -eq $wifi) { Write-Output 'NO_WIFI_RADIO'; exit 2 }
+if ($wifi.State -eq [Windows.Devices.Radios.RadioState]::On) { Write-Output 'ALREADY_ON'; exit 0 }
+$setOperation = $wifi.SetStateAsync([Windows.Devices.Radios.RadioState]::On)
+$result = $asTask.MakeGenericMethod([Windows.Devices.Radios.RadioAccessStatus]).Invoke(
+    $null, @($setOperation)
+).GetAwaiter().GetResult()
+if ($result -eq [Windows.Devices.Radios.RadioAccessStatus]::Allowed -and $wifi.State -eq [Windows.Devices.Radios.RadioState]::On) {
+    Write-Output 'ENABLED'; exit 0
+}
+Write-Error "Wi-Fi radio state change was denied: $result"
+exit 1
+"""
 
 
 def enable_powered_down_wifi_radios() -> bool:
-    """开启被 Windows 软件开关关闭的 Wi-Fi 无线电。
+    """开启 Windows 11 任务栏 Wi-Fi 开关关闭的软件无线电。
 
-    Windows 任务栏的 Wi-Fi 开关会让 ``netsh wlan connect`` 直接返回
-    "interface is powered down"。该状态下网卡仍可能显示为 Up，因此必须使用
-    WLAN API 修改软件无线电状态。硬件开关/Fn 键关闭时 API 无权开启，只记录原因。
+    该开关由 WinRT ``Windows.Devices.Radios`` 控制，并不总能通过传统 WLAN
+    API 的 radio state 观察到。此脚本只调用本机 Windows API，不需要外网，也
+    不会打开可见 PowerShell 窗口。
     """
-    client = wintypes.HANDLE()
-    interface_list: ctypes.POINTER(WLAN_INTERFACE_INFO_LIST) | None = None
     try:
-        wlanapi = _wlan_api()
-        negotiated_version = wintypes.DWORD()
-        status = wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated_version), ctypes.byref(client))
-        if status:
-            raise OSError(status, "WlanOpenHandle failed")
-        list_pointer = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
-        status = wlanapi.WlanEnumInterfaces(client, None, ctypes.byref(list_pointer))
-        if status:
-            raise OSError(status, "WlanEnumInterfaces failed")
-        interface_list = list_pointer
-        base_address = ctypes.addressof(interface_list.contents) + WLAN_INTERFACE_INFO_LIST.InterfaceInfo.offset
-        enabled = False
-        for index in range(interface_list.contents.dwNumberOfItems):
-            info = ctypes.cast(
-                base_address + index * ctypes.sizeof(WLAN_INTERFACE_INFO), ctypes.POINTER(WLAN_INTERFACE_INFO)
-            ).contents
-            # 任务栏 Wi-Fi 开关在不同 Windows/驱动版本中可能报告为 not_ready、
-            # disconnected 或其他状态。调用方已确认当前没有连接 Wi-Fi，因此这里
-            # 查询每个 WLAN 接口的实际无线电状态，不能只依赖接口状态枚举值。
-            data_size = wintypes.DWORD()
-            radio_data = ctypes.c_void_p()
-            opcode_type = wintypes.DWORD()
-            status = wlanapi.WlanQueryInterface(
-                client,
-                ctypes.byref(info.InterfaceGuid),
-                WLAN_INTF_OPCODE_RADIO_STATE,
-                None,
-                ctypes.byref(data_size),
-                ctypes.byref(radio_data),
-                ctypes.byref(opcode_type),
-            )
-            if status:
-                LOG.warning("无法读取 Wi-Fi 无线电状态（%s）：Windows 错误 %s。", info.strInterfaceDescription, status)
-                continue
-            try:
-                radio_state = ctypes.cast(radio_data, ctypes.POINTER(WLAN_RADIO_STATE)).contents
-                phy_count = min(int(radio_state.dwNumberOfPhys), WLAN_MAX_PHY_INDEX)
-                software_off = [
-                    radio_state.PhyRadioState[phy]
-                    for phy in range(phy_count)
-                    if radio_state.PhyRadioState[phy].dot11SoftwareRadioState == WLAN_RADIO_STATE_OFF
-                ]
-                if not software_off:
-                    continue
-                hardware_off = [
-                    phy for phy in software_off if phy.dot11HardwareRadioState == WLAN_RADIO_STATE_OFF
-                ]
-                if hardware_off:
-                    LOG.warning("Wi-Fi 硬件无线电已关闭（%s）；请使用机身开关或 Fn 键开启。", info.strInterfaceDescription)
-                    continue
-                for phy in software_off:
-                    phy.dot11SoftwareRadioState = WLAN_RADIO_STATE_ON
-                payload_size = ctypes.sizeof(wintypes.DWORD) + phy_count * ctypes.sizeof(WLAN_PHY_RADIO_STATE)
-                status = wlanapi.WlanSetInterface(
-                    client,
-                    ctypes.byref(info.InterfaceGuid),
-                    WLAN_INTF_OPCODE_RADIO_STATE,
-                    payload_size,
-                    ctypes.byref(radio_state),
-                    None,
-                )
-                if status:
-                    LOG.warning("无法开启 Wi-Fi 软件无线电（%s）：Windows 错误 %s。", info.strInterfaceDescription, status)
-                    continue
-                LOG.warning("检测到 Wi-Fi 软件无线电被关闭，已自动开启：%s。", info.strInterfaceDescription)
-                enabled = True
-            finally:
-                if radio_data:
-                    wlanapi.WlanFreeMemory(radio_data)
-        return enabled
-    except (AttributeError, OSError) as error:
-        LOG.warning("无法检查或开启 Wi-Fi 无线电：%s", error)
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", ENABLE_WIFI_RADIO_SCRIPT],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=False,
+            timeout=30,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.warning("开启 Wi-Fi 软件无线电超时。")
         return False
-    finally:
-        if interface_list is not None:
-            try:
-                wlanapi.WlanFreeMemory(interface_list)
-            except (UnboundLocalError, AttributeError):
-                pass
-        if client:
-            try:
-                wlanapi.WlanCloseHandle(client, None)
-            except (UnboundLocalError, AttributeError):
-                pass
+    output = (result.stdout + "\n" + result.stderr).strip()
+    if result.returncode != 0:
+        LOG.warning("无法开启 Wi-Fi 软件无线电：%s", output or f"PowerShell 退出码 {result.returncode}")
+        return False
+    if "ENABLED" in result.stdout:
+        LOG.warning("检测到任务栏 Wi-Fi 开关已关闭，已自动开启软件无线电。")
+        return True
+    return False
 
 
 def connect_wifi(ssid: str) -> bool:

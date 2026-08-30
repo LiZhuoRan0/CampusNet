@@ -1,4 +1,5 @@
 import sys
+import subprocess
 import unittest
 from http.client import RemoteDisconnected
 from pathlib import Path
@@ -117,6 +118,21 @@ class SRunEncodingTests(unittest.TestCase):
         enable_radio.assert_called_once_with()
         connect.assert_called_once_with("BIT-Web")
         sleep.assert_called_once_with(2)
+
+    def test_winrt_radio_switch_reports_when_it_turns_wifi_on(self) -> None:
+        completed = subprocess.CompletedProcess(["powershell"], 0, stdout="ENABLED\n", stderr="")
+        with (
+            patch("campusnet.subprocess.run", return_value=completed) as run,
+            patch.object(campusnet.LOG, "warning") as warning,
+        ):
+            self.assertTrue(campusnet.enable_powered_down_wifi_radios())
+        self.assertEqual(run.call_args.args[0][0], "powershell")
+        warning.assert_called_once()
+
+    def test_winrt_radio_switch_noops_when_wifi_is_already_on(self) -> None:
+        completed = subprocess.CompletedProcess(["powershell"], 0, stdout="ALREADY_ON\n", stderr="")
+        with patch("campusnet.subprocess.run", return_value=completed):
+            self.assertFalse(campusnet.enable_powered_down_wifi_radios())
 
 
 if __name__ == "__main__":
