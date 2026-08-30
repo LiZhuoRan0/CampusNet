@@ -57,7 +57,6 @@ def configure_logging() -> logging.Logger:
 LOG = configure_logging()
 SINGLE_INSTANCE_MUTEX: int | None = None
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-WLAN_INTERFACE_STATE_NOT_READY = 0
 WLAN_INTF_OPCODE_RADIO_STATE = 4
 WLAN_RADIO_STATE_OFF = 0
 WLAN_RADIO_STATE_ON = 1
@@ -399,9 +398,9 @@ def enable_powered_down_wifi_radios() -> bool:
             info = ctypes.cast(
                 base_address + index * ctypes.sizeof(WLAN_INTERFACE_INFO), ctypes.POINTER(WLAN_INTERFACE_INFO)
             ).contents
-            # 仅处理 Windows 报告“未就绪”的无线接口，不影响用户主动正在使用的 Wi-Fi。
-            if info.isState != WLAN_INTERFACE_STATE_NOT_READY:
-                continue
+            # 任务栏 Wi-Fi 开关在不同 Windows/驱动版本中可能报告为 not_ready、
+            # disconnected 或其他状态。调用方已确认当前没有连接 Wi-Fi，因此这里
+            # 查询每个 WLAN 接口的实际无线电状态，不能只依赖接口状态枚举值。
             data_size = wintypes.DWORD()
             radio_data = ctypes.c_void_p()
             opcode_type = wintypes.DWORD()
