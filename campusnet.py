@@ -57,6 +57,11 @@ def configure_logging() -> logging.Logger:
 LOG = configure_logging()
 SINGLE_INSTANCE_MUTEX: int | None = None
 NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+WLAN_INTERFACE_STATE_NOT_READY = 0
+WLAN_INTF_OPCODE_RADIO_STATE = 4
+WLAN_RADIO_STATE_OFF = 0
+WLAN_RADIO_STATE_ON = 1
+WLAN_MAX_PHY_INDEX = 64
 
 
 class PortalRequestError(RuntimeError):
@@ -80,6 +85,46 @@ class WifiStatus:
     interface_name: str | None
     ssid: str | None
     connected: bool
+
+
+class GUID(ctypes.Structure):
+    _fields_ = [
+        ("Data1", wintypes.DWORD),
+        ("Data2", wintypes.WORD),
+        ("Data3", wintypes.WORD),
+        ("Data4", ctypes.c_ubyte * 8),
+    ]
+
+
+class WLAN_INTERFACE_INFO(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceGuid", GUID),
+        ("strInterfaceDescription", ctypes.c_wchar * 256),
+        ("isState", wintypes.DWORD),
+    ]
+
+
+class WLAN_INTERFACE_INFO_LIST(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfItems", wintypes.DWORD),
+        ("dwIndex", wintypes.DWORD),
+        ("InterfaceInfo", WLAN_INTERFACE_INFO * 1),
+    ]
+
+
+class WLAN_PHY_RADIO_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwPhyIndex", wintypes.DWORD),
+        ("dot11SoftwareRadioState", wintypes.DWORD),
+        ("dot11HardwareRadioState", wintypes.DWORD),
+    ]
+
+
+class WLAN_RADIO_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwNumberOfPhys", wintypes.DWORD),
+        ("PhyRadioState", WLAN_PHY_RADIO_STATE * WLAN_MAX_PHY_INDEX),
+    ]
 
 
 def acquire_single_instance() -> bool:
@@ -286,6 +331,144 @@ def current_ssid() -> str | None:
     return status.ssid if status.connected else None
 
 
+def _wlan_api() -> Any:
+    """配置 Windows WLAN API 的 ctypes 签名。"""
+    wlanapi = ctypes.WinDLL("wlanapi", use_last_error=True)
+    wlanapi.WlanOpenHandle.argtypes = (
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(wintypes.HANDLE),
+    )
+    wlanapi.WlanOpenHandle.restype = wintypes.DWORD
+    wlanapi.WlanCloseHandle.argtypes = (wintypes.HANDLE, ctypes.c_void_p)
+    wlanapi.WlanCloseHandle.restype = wintypes.DWORD
+    wlanapi.WlanEnumInterfaces.argtypes = (
+        wintypes.HANDLE,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)),
+    )
+    wlanapi.WlanEnumInterfaces.restype = wintypes.DWORD
+    wlanapi.WlanQueryInterface.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(GUID),
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.POINTER(wintypes.DWORD),
+        ctypes.POINTER(ctypes.c_void_p),
+        ctypes.POINTER(wintypes.DWORD),
+    )
+    wlanapi.WlanQueryInterface.restype = wintypes.DWORD
+    wlanapi.WlanSetInterface.argtypes = (
+        wintypes.HANDLE,
+        ctypes.POINTER(GUID),
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    )
+    wlanapi.WlanSetInterface.restype = wintypes.DWORD
+    wlanapi.WlanFreeMemory.argtypes = (ctypes.c_void_p,)
+    wlanapi.WlanFreeMemory.restype = None
+    return wlanapi
+
+
+def enable_powered_down_wifi_radios() -> bool:
+    """开启被 Windows 软件开关关闭的 Wi-Fi 无线电。
+
+    Windows 任务栏的 Wi-Fi 开关会让 ``netsh wlan connect`` 直接返回
+    "interface is powered down"。该状态下网卡仍可能显示为 Up，因此必须使用
+    WLAN API 修改软件无线电状态。硬件开关/Fn 键关闭时 API 无权开启，只记录原因。
+    """
+    client = wintypes.HANDLE()
+    interface_list: ctypes.POINTER(WLAN_INTERFACE_INFO_LIST) | None = None
+    try:
+        wlanapi = _wlan_api()
+        negotiated_version = wintypes.DWORD()
+        status = wlanapi.WlanOpenHandle(2, None, ctypes.byref(negotiated_version), ctypes.byref(client))
+        if status:
+            raise OSError(status, "WlanOpenHandle failed")
+        list_pointer = ctypes.POINTER(WLAN_INTERFACE_INFO_LIST)()
+        status = wlanapi.WlanEnumInterfaces(client, None, ctypes.byref(list_pointer))
+        if status:
+            raise OSError(status, "WlanEnumInterfaces failed")
+        interface_list = list_pointer
+        base_address = ctypes.addressof(interface_list.contents) + WLAN_INTERFACE_INFO_LIST.InterfaceInfo.offset
+        enabled = False
+        for index in range(interface_list.contents.dwNumberOfItems):
+            info = ctypes.cast(
+                base_address + index * ctypes.sizeof(WLAN_INTERFACE_INFO), ctypes.POINTER(WLAN_INTERFACE_INFO)
+            ).contents
+            # 仅处理 Windows 报告“未就绪”的无线接口，不影响用户主动正在使用的 Wi-Fi。
+            if info.isState != WLAN_INTERFACE_STATE_NOT_READY:
+                continue
+            data_size = wintypes.DWORD()
+            radio_data = ctypes.c_void_p()
+            opcode_type = wintypes.DWORD()
+            status = wlanapi.WlanQueryInterface(
+                client,
+                ctypes.byref(info.InterfaceGuid),
+                WLAN_INTF_OPCODE_RADIO_STATE,
+                None,
+                ctypes.byref(data_size),
+                ctypes.byref(radio_data),
+                ctypes.byref(opcode_type),
+            )
+            if status:
+                LOG.warning("无法读取 Wi-Fi 无线电状态（%s）：Windows 错误 %s。", info.strInterfaceDescription, status)
+                continue
+            try:
+                radio_state = ctypes.cast(radio_data, ctypes.POINTER(WLAN_RADIO_STATE)).contents
+                phy_count = min(int(radio_state.dwNumberOfPhys), WLAN_MAX_PHY_INDEX)
+                software_off = [
+                    radio_state.PhyRadioState[phy]
+                    for phy in range(phy_count)
+                    if radio_state.PhyRadioState[phy].dot11SoftwareRadioState == WLAN_RADIO_STATE_OFF
+                ]
+                if not software_off:
+                    continue
+                hardware_off = [
+                    phy for phy in software_off if phy.dot11HardwareRadioState == WLAN_RADIO_STATE_OFF
+                ]
+                if hardware_off:
+                    LOG.warning("Wi-Fi 硬件无线电已关闭（%s）；请使用机身开关或 Fn 键开启。", info.strInterfaceDescription)
+                    continue
+                for phy in software_off:
+                    phy.dot11SoftwareRadioState = WLAN_RADIO_STATE_ON
+                payload_size = ctypes.sizeof(wintypes.DWORD) + phy_count * ctypes.sizeof(WLAN_PHY_RADIO_STATE)
+                status = wlanapi.WlanSetInterface(
+                    client,
+                    ctypes.byref(info.InterfaceGuid),
+                    WLAN_INTF_OPCODE_RADIO_STATE,
+                    payload_size,
+                    ctypes.byref(radio_state),
+                    None,
+                )
+                if status:
+                    LOG.warning("无法开启 Wi-Fi 软件无线电（%s）：Windows 错误 %s。", info.strInterfaceDescription, status)
+                    continue
+                LOG.warning("检测到 Wi-Fi 软件无线电被关闭，已自动开启：%s。", info.strInterfaceDescription)
+                enabled = True
+            finally:
+                if radio_data:
+                    wlanapi.WlanFreeMemory(radio_data)
+        return enabled
+    except (AttributeError, OSError) as error:
+        LOG.warning("无法检查或开启 Wi-Fi 无线电：%s", error)
+        return False
+    finally:
+        if interface_list is not None:
+            try:
+                wlanapi.WlanFreeMemory(interface_list)
+            except (UnboundLocalError, AttributeError):
+                pass
+        if client:
+            try:
+                wlanapi.WlanCloseHandle(client, None)
+            except (UnboundLocalError, AttributeError):
+                pass
+
+
 def connect_wifi(ssid: str) -> bool:
     try:
         # 此命令仅调用 Windows 已保存的 Wi-Fi 配置，不需要外网连接。
@@ -452,6 +635,9 @@ def ensure_connected(
     # 未连接任何 Wi-Fi 时，直接使用 Windows 本地保存的配置重连；不等待外网探测超时。
     if active_ssid is None:
         LOG.warning("当前未连接 Wi-Fi，开始连接 %s。", ssid)
+        if enable_powered_down_wifi_radios():
+            # 软件无线电刚开启时，给驱动少量时间恢复扫描能力；不依赖外网。
+            time.sleep(2)
         if not connect_wifi(ssid):
             return ConnectionAttempt(False)
         status = wait_for_wifi(ssid, int(config["wifi"].get("connect_wait_seconds", 20)))

@@ -98,6 +98,26 @@ class SRunEncodingTests(unittest.TestCase):
         self.assertTrue(result.healthy)
         renew.assert_called_once_with("WLAN 2")
 
+    def test_disconnected_wifi_checks_software_radio_before_connecting(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        disconnected = campusnet.WifiStatus("WLAN 2", None, False)
+        connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        with (
+            patch("campusnet.wifi_status", return_value=disconnected),
+            patch("campusnet.enable_powered_down_wifi_radios", return_value=True) as enable_radio,
+            patch("campusnet.connect_wifi", return_value=True) as connect,
+            patch("campusnet.wait_for_wifi", return_value=connected),
+            patch("campusnet.internet_available", return_value=True),
+            patch("campusnet.time.sleep") as sleep,
+            patch.object(campusnet.LOG, "warning"),
+            patch.object(campusnet.LOG, "info"),
+        ):
+            result = campusnet.ensure_connected(config)
+        self.assertTrue(result.healthy)
+        enable_radio.assert_called_once_with()
+        connect.assert_called_once_with("BIT-Web")
+        sleep.assert_called_once_with(2)
+
 
 if __name__ == "__main__":
     unittest.main()
