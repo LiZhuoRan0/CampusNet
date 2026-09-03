@@ -134,6 +134,45 @@ class SRunEncodingTests(unittest.TestCase):
         with patch("campusnet.subprocess.run", return_value=completed):
             self.assertFalse(campusnet.enable_powered_down_wifi_radios())
 
+    def test_successful_wifi_recovery_clears_state_without_scheduling_another_one(self) -> None:
+        config = {
+            "wifi": {
+                "ssid": "BIT-Web",
+                "reconnect_after_portal_failures": 3,
+                "dhcp_renew_after_wifi_recoveries": 2,
+                "adapter_reset_after_wifi_recoveries": 5,
+            },
+            "check_interval_seconds": 60,
+            "retry_interval_seconds": 10,
+        }
+        attempts = [
+            campusnet.ConnectionAttempt(False, portal_transport_failure=True),
+            campusnet.ConnectionAttempt(False, portal_transport_failure=True),
+            campusnet.ConnectionAttempt(False, portal_transport_failure=True),
+            campusnet.ConnectionAttempt(True),
+        ]
+        with (
+            patch("campusnet.acquire_single_instance", return_value=True),
+            patch("campusnet.load_config", return_value=config),
+            patch("campusnet.ensure_connected", side_effect=attempts) as ensure,
+            patch("campusnet.wifi_recovery_cooldown") as cooldown,
+            patch("campusnet.time.sleep", side_effect=[None, None, None, KeyboardInterrupt]),
+            patch.object(campusnet.LOG, "info") as info,
+            patch.object(sys, "argv", ["campusnet.py"]),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                campusnet.main()
+
+        self.assertEqual(
+            [call.kwargs["force_wifi_reconnect"] for call in ensure.call_args_list],
+            [False, False, False, True],
+        )
+        cooldown.assert_not_called()
+        self.assertIn(
+            "网络已恢复正常，已清除失败计数；不会再执行计划中的 Wi-Fi 物理恢复。",
+            [call.args[0] for call in info.call_args_list],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

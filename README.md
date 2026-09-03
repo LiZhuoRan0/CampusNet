@@ -66,6 +66,8 @@ powershell -ExecutionPolicy Bypass -File .\uninstall_autostart.ps1
 
 运行日志写入 `campusnet.log`，其中不会记录账号或密码。日志按天轮转，并自动删除 30 天前的内容。
 
+日志只记录已经发生的动作：网络恢复时会写明“已清除失败计数”；只有 Wi-Fi 恢复后网络仍不可用时，才会说明后续认证重试和下一次物理恢复所需的条件，不会在网络正常时提示即将断开 Wi-Fi。
+
 ## 查看日志：
 
 ```powershell

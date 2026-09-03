@@ -600,19 +600,29 @@ def main() -> int:
                 attempt = ConnectionAttempt(False)
             healthy = attempt.healthy
             if healthy:
+                if force_wifi_reconnect:
+                    LOG.info("网络已恢复正常，已清除失败计数；不会再执行计划中的 Wi-Fi 物理恢复。")
                 portal_transport_failures = 0
                 wifi_recovery_count = 0
                 next_wifi_recovery_at = 0.0
-            elif attempt.portal_transport_failure:
-                portal_transport_failures += 1
-            if force_wifi_reconnect:
-                wifi_recovery_count += 1
-                cooldown = wifi_recovery_cooldown(config, wifi_recovery_count)
-                next_wifi_recovery_at = time.monotonic() + cooldown
-                # 已实际执行恢复动作后重新累计连续门户失败次数；在冷却期内仍
-                # 每 10 秒认证，但不反复断开 Wi-Fi。
-                portal_transport_failures = 0
-                LOG.info("下一次 Wi-Fi 物理恢复最早将在 %s 秒后执行。", cooldown)
+            else:
+                if attempt.portal_transport_failure:
+                    portal_transport_failures += 1
+                if force_wifi_reconnect:
+                    wifi_recovery_count += 1
+                    cooldown = wifi_recovery_cooldown(config, wifi_recovery_count)
+                    next_wifi_recovery_at = time.monotonic() + cooldown
+                    # 已执行本轮恢复后重新累计门户失败次数。冷却期内仍每 10 秒
+                    # 认证，但不会反复断开 Wi-Fi。
+                    portal_transport_failures = 0
+                    LOG.info(
+                        "本轮 Wi-Fi 恢复后网络仍不可用；认证将继续每 %s 秒重试。"
+                        "若再次连续 %s 次连接门户失败，且距离本次恢复已满 %s 秒，"
+                        "才会再进行 Wi-Fi 物理恢复。",
+                        retry_interval,
+                        reconnect_threshold,
+                        cooldown,
+                    )
             if args.once:
                 return 0 if healthy else 1
             # 按每次尝试的开始时间计时，避免“检测耗时 + 重试间隔”把周期拉长。
