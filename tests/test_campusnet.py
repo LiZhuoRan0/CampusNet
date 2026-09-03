@@ -4,6 +4,7 @@ import unittest
 from http.client import RemoteDisconnected
 from pathlib import Path
 from unittest.mock import patch
+from urllib.error import URLError
 
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -35,6 +36,19 @@ class SRunEncodingTests(unittest.TestCase):
         with patch("campusnet.urlopen", side_effect=RemoteDisconnected("closed")):
             with self.assertRaises(campusnet.PortalTransportError):
                 campusnet.jsonp("http://10.0.0.55/cgi-bin/get_challenge", {})
+
+    def test_fast_network_check_uses_only_one_probe_and_short_timeout(self) -> None:
+        config = {
+            "network_check": {
+                "probes": [{"url": "http://first"}, {"url": "http://second"}],
+                "timeout_seconds": 8,
+                "retry_timeout_seconds": 2,
+            }
+        }
+        with patch("campusnet.urlopen", side_effect=URLError("offline")) as urlopen:
+            self.assertFalse(campusnet.internet_available(config, fast=True))
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 2)
 
     def test_forced_reconnect_resets_wifi_before_checking_network(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
@@ -166,6 +180,10 @@ class SRunEncodingTests(unittest.TestCase):
         self.assertEqual(
             [call.kwargs["force_wifi_reconnect"] for call in ensure.call_args_list],
             [False, False, False, True],
+        )
+        self.assertEqual(
+            [call.kwargs["fast_network_check"] for call in ensure.call_args_list],
+            [False, True, True, True],
         )
         cooldown.assert_not_called()
         self.assertIn(

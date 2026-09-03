@@ -30,7 +30,8 @@
         "expected_status": 204
       }
     ],
-    "timeout_seconds": 8
+    "timeout_seconds": 8,
+    "retry_timeout_seconds": 2
   },
   "check_interval_seconds": 60,
   "retry_interval_seconds": 10

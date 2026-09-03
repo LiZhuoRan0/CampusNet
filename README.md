@@ -125,4 +125,6 @@ netsh wlan connect name=BIT-Web
 - `dhcp_renew_after_wifi_recoveries`：第几次物理恢复起续租 DHCP，默认 2。
 - `adapter_reset_after_wifi_recoveries`：第几次物理恢复起尝试重置无线适配器，默认 5；若系统拒绝权限，会自动跳过。
 
+首次发现断网时，程序仍使用两个外网探测地址确认；后续恢复重试改用一个最多 2 秒的快速探测，然后直接认证，避免每轮都等待两个外网请求超时。`network_check.retry_timeout_seconds` 可调整这个快速探测的超时，默认 2 秒。
+
 若电脑未连接任何 Wi-Fi，程序会跳过外网探测，立即执行本地 `netsh` 命令连接 `BIT-Web`。若正连接其他且能正常联网的 Wi-Fi，则不会抢占该连接。

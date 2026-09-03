@@ -470,11 +470,14 @@ def wifi_recovery_cooldown(config: dict[str, Any], recovery_count: int) -> int:
     return min(maximum, base * (2 ** max(0, recovery_count - 1)))
 
 
-def internet_available(config: dict[str, Any]) -> bool:
+def internet_available(config: dict[str, Any], fast: bool = False) -> bool:
     # 认证门户也可能返回 HTTP 200；因此必须同时核对预期的状态码或正文，不能只看请求是否成功。
-    for probe in config["network_check"]["probes"]:
+    network_check = config["network_check"]
+    probes = network_check["probes"][:1] if fast else network_check["probes"]
+    timeout_seconds = int(network_check.get("retry_timeout_seconds", 2)) if fast else int(network_check["timeout_seconds"])
+    for probe in probes:
         try:
-            with urlopen(Request(probe["url"], headers={"User-Agent": "CampusNet/1.0"}), timeout=int(config["network_check"]["timeout_seconds"])) as response:
+            with urlopen(Request(probe["url"], headers={"User-Agent": "CampusNet/1.0"}), timeout=timeout_seconds) as response:
                 expected_status = probe.get("expected_status")
                 expected_text = probe.get("expected_text")
                 if expected_status is not None and response.status != expected_status:
@@ -493,6 +496,7 @@ def ensure_connected(
     force_wifi_reconnect: bool = False,
     renew_dhcp: bool = False,
     reset_adapter: bool = False,
+    fast_network_check: bool = False,
 ) -> ConnectionAttempt:
     ssid = str(config["wifi"]["ssid"])
     status = wifi_status()
@@ -540,12 +544,15 @@ def ensure_connected(
         if status is None:
             return ConnectionAttempt(False)
 
-    if internet_available(config):
+    if internet_available(config, fast=fast_network_check):
         LOG.info("网络正常。")
         return ConnectionAttempt(True)
 
     # 已连接时只访问校园网内网门户；因此外网断开也可完成认证。
-    LOG.warning("检测到网络不可用，正在进行校园网认证。")
+    if fast_network_check:
+        LOG.warning("网络仍不可用，正在快速重试校园网认证。")
+    else:
+        LOG.warning("检测到网络不可用，正在进行校园网认证。")
     try:
         success, message = srun_login(config)
     except PortalTransportError as error:
@@ -556,9 +563,14 @@ def ensure_connected(
         return ConnectionAttempt(False)
     LOG.info("认证%s：%s", "成功" if success else "失败", message)
     if not success:
+        # 在快速恢复路径中，网络可能已自然恢复而门户仍返回“已在线”等结果。
+        # 再做一次短探测，避免无谓地把健康网络继续当作断网处理。
+        if fast_network_check and internet_available(config, fast=True):
+            LOG.info("网络已恢复正常。")
+            return ConnectionAttempt(True)
         return ConnectionAttempt(False)
     time.sleep(3)
-    return ConnectionAttempt(internet_available(config))
+    return ConnectionAttempt(internet_available(config, fast=fast_network_check))
 
 
 def main() -> int:
@@ -581,6 +593,9 @@ def main() -> int:
             force_wifi_reconnect = (
                 portal_transport_failures >= reconnect_threshold and attempt_started >= next_wifi_recovery_at
             )
+            # 第一次异常保留完整双探测，避免误报；一旦门户已经断开过，后续
+            # 重试只做单个短探测，随后直接认证，避免每 10 秒都耗在外网超时上。
+            fast_network_check = portal_transport_failures > 0
             recovery_number = wifi_recovery_count + 1 if force_wifi_reconnect else 0
             renew_dhcp = force_wifi_reconnect and recovery_number >= max(
                 1, int(config["wifi"].get("dhcp_renew_after_wifi_recoveries", 2))
@@ -594,6 +609,7 @@ def main() -> int:
                     force_wifi_reconnect=force_wifi_reconnect,
                     renew_dhcp=renew_dhcp,
                     reset_adapter=reset_adapter,
+                    fast_network_check=fast_network_check,
                 )
             except Exception as error:  # 保活程序不能因一次网络错误退出
                 LOG.exception("本次检测出错：%s", error)
