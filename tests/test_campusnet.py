@@ -13,6 +13,17 @@ import campusnet
 
 
 class SRunEncodingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # 测试会刻意模拟断网和恢复。绝不能让这些模拟事件写入用户的
+        # campusnet.log，也避免在测试终端显示为真实故障。
+        cls._previous_log_disabled = campusnet.LOG.disabled
+        campusnet.LOG.disabled = True
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        campusnet.LOG.disabled = cls._previous_log_disabled
+
     def test_custom_base64_matches_bit_portal_alphabet(self) -> None:
         self.assertEqual(
             campusnet.srun_base64_encode(b"CampusNet SRun info"),
