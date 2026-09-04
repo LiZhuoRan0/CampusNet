@@ -286,6 +286,35 @@ def current_ssid() -> str | None:
     return status.ssid if status.connected else None
 
 
+def wifi_diagnostic_summary() -> str:
+    """返回一次断网时可读、且不含账号密码的 WLAN 现场摘要。"""
+    try:
+        result = subprocess.run(
+            ["netsh", "wlan", "show", "interfaces"],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=10,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        return "Wi-Fi 状态查询超时"
+
+    fields: dict[str, str] = {}
+    patterns = {
+        "接口": r"^\s*(?:Name|名称)\s*:\s*(.*?)\s*$",
+        "状态": r"^\s*(?:State|状态)\s*:\s*(.*?)\s*$",
+        "SSID": r"^\s*SSID\s*:\s*(.*?)\s*$",
+        "接入点": r"^\s*(?:BSSID|接入点\s*BSSID)\s*:\s*(.*?)\s*$",
+        "信号": r"^\s*(?:Signal|信号)\s*:\s*(.*?)\s*$",
+    }
+    for line in result.stdout.splitlines():
+        for label, pattern in patterns.items():
+            if match := re.match(pattern, line, flags=re.IGNORECASE):
+                fields[label] = match.group(1) or "无"
+                break
+    if not fields:
+        return "Windows 未返回可识别的 Wi-Fi 接口状态"
+    return "，".join(f"{label}={value}" for label, value in fields.items())
+
+
 ENABLE_WIFI_RADIO_SCRIPT = r"""
 $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Runtime.WindowsRuntime
@@ -473,7 +502,11 @@ def reset_wifi_adapter(interface_name: str | None) -> bool:
             creationflags=NO_WINDOW,
         )
         if disabled.returncode != 0:
-            LOG.warning("无线适配器重置未获执行（接口：%s）：%s", interface_name, disabled.stderr.strip() or disabled.stdout.strip())
+            LOG.warning(
+                "无线适配器重置未获执行（接口：%s；通常是当前进程未以管理员权限运行）：%s",
+                interface_name,
+                disabled.stderr.strip() or disabled.stdout.strip(),
+            )
             return False
         LOG.warning("已禁用无线适配器，正在重新启用：%s。", interface_name)
         time.sleep(3)
@@ -534,9 +567,11 @@ def ensure_connected(
     if force_wifi_reconnect and active_ssid == ssid:
         LOG.warning("校园网门户连续连接失败，正在重置 Wi-Fi 开关并重新连接：%s。", ssid)
         if not cycle_wifi_radio():
-            LOG.warning("Wi-Fi 开关重置失败，改用普通断开并重新关联。")
-            disconnect_wifi()
-            time.sleep(1)
+            LOG.warning("Wi-Fi 开关重置失败，尝试管理员级无线适配器重置。")
+            if not reset_wifi_adapter(status.interface_name):
+                LOG.warning("管理员级无线适配器重置未成功，改用普通断开并重新关联。")
+                disconnect_wifi()
+                time.sleep(1)
         active_ssid = None
 
     # 未连接任何 Wi-Fi 时，直接使用 Windows 本地保存的配置重连；不等待外网探测超时。
@@ -609,12 +644,13 @@ def main() -> int:
             LOG.info("已有 CampusNet 实例在运行，本次启动退出。")
             return 0
         config = load_config()
-        normal_interval = max(10, int(config.get("check_interval_seconds", 60)))
+        normal_interval = max(10, int(config.get("check_interval_seconds", 30)))
         retry_interval = max(1, int(config.get("retry_interval_seconds", 10)))
         reconnect_threshold = max(1, int(config["wifi"].get("reconnect_after_portal_failures", 3)))
         portal_transport_failures = 0
         wifi_recovery_count = 0
         next_wifi_recovery_at = 0.0
+        outage_started_at: float | None = None
         while True:
             attempt_started = time.monotonic()
             force_wifi_reconnect = (
@@ -639,12 +675,18 @@ def main() -> int:
                 attempt = ConnectionAttempt(False)
             healthy = attempt.healthy
             if healthy:
+                if outage_started_at is not None:
+                    LOG.info("网络已恢复；本次断网持续约 %.0f 秒。", time.monotonic() - outage_started_at)
+                    outage_started_at = None
                 if force_wifi_reconnect:
                     LOG.info("网络已恢复正常，已清除失败计数；不会再执行计划中的 Wi-Fi 物理恢复。")
                 portal_transport_failures = 0
                 wifi_recovery_count = 0
                 next_wifi_recovery_at = 0.0
             else:
+                if outage_started_at is None:
+                    outage_started_at = attempt_started
+                    LOG.warning("断网现场：%s。", wifi_diagnostic_summary())
                 if attempt.portal_transport_failure:
                     portal_transport_failures += 1
                 if force_wifi_reconnect:

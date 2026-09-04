@@ -1,6 +1,6 @@
 # BIT-Web 自动重连与登录
 
-这是一个无需第三方依赖的 Windows Python 程序。它每 60 秒检查一次真实外网连通性；不可用时会：
+这是一个无需第三方依赖的 Windows Python 程序。它每 30 秒检查一次真实外网连通性；不可用时会：
 
 1. 连接已保存的 `BIT-Web` Wi-Fi 配置；
 2. 按北京理工大学深澜（SRun）门户的 challenge 加密流程登录；
@@ -8,13 +8,13 @@
 
 认证中的 `info` 字段使用北理门户配置的自定义 Base64 字母表；相关值可在 `config.json` 的 `portal.base64_alphabet` 中覆盖。
 
-如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 3 次中断连接，程序会自动进行分层恢复，并继续认证。该过程只使用 Windows 本地 Wi-Fi 配置、DHCP 和校园网内网，不依赖外网：
+如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 2 次中断连接，程序会自动进行分层恢复，并继续认证。该过程只使用 Windows 本地 Wi-Fi 配置、DHCP 和校园网内网，不依赖外网：
 
 1. 确认 Windows 实际已关联到 `BIT-Web`（不是只看连接命令是否提交成功）；
 2. 若 Windows 软件无线电被任务栏 Wi-Fi 开关关闭，自动开启无线电，再连接已保存的 `BIT-Web` 配置；
 3. 模拟任务栏 Wi-Fi 开关“关→开”，再重新连接已保存的 Wi-Fi 配置；
 4. 第二轮 Wi-Fi 恢复起，重新获取 DHCP 地址；
-5. 长期失败时，尝试无弹窗地重置无线适配器；若 Windows 策略不允许普通用户重置，程序会记录失败并继续其他恢复步骤，不会弹窗或退出；
+5. 若无线电重置失败，使用最高权限计划任务无弹窗地禁用再启用无线适配器；若硬件或系统仍拒绝，才退回普通断开并重新关联；
 6. Wi-Fi 的物理重连采用 30 秒、60 秒、120 秒、最多 300 秒的退避，避免校园网门户故障时反复断网；认证请求本身仍按 10 秒间隔继续。
 
 ## 首次使用
@@ -48,15 +48,17 @@ Copy-Item .\config.example.json .\config.json
 python .\campusnet.py --once
 ```
 
-首次运行会把 `config.json` 中的明文密码替换为 Windows DPAPI 密文，只能由当前 Windows 用户解密。程序已安装到当前 Windows 用户的“启动”文件夹，登录后会自动运行。
+首次运行会把 `config.json` 中的明文密码替换为 Windows DPAPI 密文，只能由当前 Windows 用户解密。
 
 ## 重新安装
 
-若日后需要重新安装，可执行：
+安装或重新安装自动运行，请执行：
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
 ```
+
+该命令会出现一次 Windows UAC 确认：确认后，程序会以当前用户的“最高权限”计划任务在登录时自动后台运行，且立即替换当前的普通后台实例。这样当 Wi-Fi 无线电重置不足时，程序也可自行重置无线适配器；日常运行不会弹窗。
 
 ## 停止自动运行
 
@@ -76,7 +78,7 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
 
 ## 代码逻辑
 
-程序正常时每 60 秒检测一次；检测失败后按每次尝试的开始时间约每 10 秒重试，直至网络恢复。核心逻辑如下：
+程序正常时每 30 秒检测一次；检测失败后按每次尝试的开始时间约每 10 秒重试，直至网络恢复。首次发现断网会记录 Wi-Fi 接口、关联状态、SSID、接入点和信号强度；恢复时会记录本次断网总时长。核心逻辑如下：
 
 ```text
 检测外网是否真的可访问
@@ -90,7 +92,7 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
             │
             ├─ 等待 Windows 确认已实际关联 BIT-Web
             │
-            ├─ 多轮失败时续租 DHCP；长期失败时尝试重置无线适配器
+            ├─ 多轮失败时续租 DHCP；无线电重置失败时以最高权限重置无线适配器
             │
             ├─ 已连接 BIT-Web 后，向校园网认证服务器请求 challenge
             │

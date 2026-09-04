@@ -75,6 +75,7 @@ class SRunEncodingTests(unittest.TestCase):
         with (
             patch("campusnet.wifi_status", return_value=connected),
             patch("campusnet.cycle_wifi_radio", return_value=False),
+            patch("campusnet.reset_wifi_adapter", return_value=False) as reset_adapter,
             patch("campusnet.disconnect_wifi", return_value=True) as disconnect,
             patch("campusnet.connect_wifi", return_value=True),
             patch("campusnet.wait_for_wifi", return_value=connected),
@@ -85,7 +86,28 @@ class SRunEncodingTests(unittest.TestCase):
         ):
             result = campusnet.ensure_connected(config, force_wifi_reconnect=True)
         self.assertTrue(result.healthy)
+        reset_adapter.assert_called_once_with("WLAN 2")
         disconnect.assert_called_once_with()
+
+    def test_forced_reconnect_uses_adapter_reset_before_disconnect(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        with (
+            patch("campusnet.wifi_status", return_value=connected),
+            patch("campusnet.cycle_wifi_radio", return_value=False),
+            patch("campusnet.reset_wifi_adapter", return_value=True) as reset_adapter,
+            patch("campusnet.disconnect_wifi") as disconnect,
+            patch("campusnet.connect_wifi", return_value=True),
+            patch("campusnet.wait_for_wifi", return_value=connected),
+            patch("campusnet.internet_available", return_value=True),
+            patch("campusnet.time.sleep"),
+            patch.object(campusnet.LOG, "warning"),
+            patch.object(campusnet.LOG, "info"),
+        ):
+            result = campusnet.ensure_connected(config, force_wifi_reconnect=True)
+        self.assertTrue(result.healthy)
+        reset_adapter.assert_called_once_with("WLAN 2")
+        disconnect.assert_not_called()
 
     def test_wait_for_wifi_requires_connected_state_and_matching_ssid(self) -> None:
         statuses = [
@@ -189,6 +211,7 @@ class SRunEncodingTests(unittest.TestCase):
             patch("campusnet.load_config", return_value=config),
             patch("campusnet.ensure_connected", side_effect=attempts) as ensure,
             patch("campusnet.wifi_recovery_cooldown") as cooldown,
+            patch("campusnet.wifi_diagnostic_summary", return_value="状态=已连接"),
             patch("campusnet.time.sleep", side_effect=[None, None, None, KeyboardInterrupt]),
             patch.object(campusnet.LOG, "info") as info,
             patch.object(sys, "argv", ["campusnet.py"]),
