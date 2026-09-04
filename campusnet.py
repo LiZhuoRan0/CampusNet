@@ -345,6 +345,36 @@ def enable_powered_down_wifi_radios() -> bool:
     return False
 
 
+CYCLE_WIFI_RADIO_SCRIPT = ENABLE_WIFI_RADIO_SCRIPT.replace(
+    "$setOperation = $wifi.SetStateAsync([Windows.Devices.Radios.RadioState]::On)",
+    "$setOperation = $wifi.SetStateAsync([Windows.Devices.Radios.RadioState]::Off)\n"
+    "$null = $asTask.MakeGenericMethod([Windows.Devices.Radios.RadioAccessStatus]).Invoke($null, @($setOperation)).GetAwaiter().GetResult()\n"
+    "Start-Sleep -Seconds 2\n"
+    "$setOperation = $wifi.SetStateAsync([Windows.Devices.Radios.RadioState]::On)",
+).replace(
+    "if ($wifi.State -eq [Windows.Devices.Radios.RadioState]::On) { Write-Output 'ALREADY_ON'; exit 0 }\n",
+    "",
+)
+
+
+def cycle_wifi_radio() -> bool:
+    """模拟任务栏 Wi-Fi 开关的“关→开”，不需要管理员权限。"""
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", CYCLE_WIFI_RADIO_SCRIPT],
+            capture_output=True, text=True, encoding="utf-8", errors="replace", check=False, timeout=30,
+            creationflags=NO_WINDOW,
+        )
+    except subprocess.TimeoutExpired:
+        LOG.warning("Wi-Fi 无线电重置超时。")
+        return False
+    if result.returncode != 0:
+        LOG.warning("Wi-Fi 无线电重置失败：%s", (result.stdout + "\n" + result.stderr).strip())
+        return False
+    LOG.info("已关闭并重新开启 Wi-Fi 软件无线电。")
+    return True
+
+
 def connect_wifi(ssid: str) -> bool:
     try:
         # 此命令仅调用 Windows 已保存的 Wi-Fi 配置，不需要外网连接。
@@ -495,7 +525,6 @@ def ensure_connected(
     config: dict[str, Any],
     force_wifi_reconnect: bool = False,
     renew_dhcp: bool = False,
-    reset_adapter: bool = False,
     fast_network_check: bool = False,
 ) -> ConnectionAttempt:
     ssid = str(config["wifi"]["ssid"])
@@ -503,11 +532,9 @@ def ensure_connected(
     active_ssid = status.ssid if status.connected else None
 
     if force_wifi_reconnect and active_ssid == ssid:
-        if reset_adapter:
-            LOG.warning("校园网门户长期不可达，正在重置无线适配器后重新关联 Wi-Fi：%s。", ssid)
-            reset_wifi_adapter(status.interface_name)
-        else:
-            LOG.warning("校园网门户连续连接失败，正在重新关联 Wi-Fi：%s。", ssid)
+        LOG.warning("校园网门户连续连接失败，正在重置 Wi-Fi 开关并重新连接：%s。", ssid)
+        if not cycle_wifi_radio():
+            LOG.warning("Wi-Fi 开关重置失败，改用普通断开并重新关联。")
             disconnect_wifi()
             time.sleep(1)
         active_ssid = None
@@ -600,15 +627,11 @@ def main() -> int:
             renew_dhcp = force_wifi_reconnect and recovery_number >= max(
                 1, int(config["wifi"].get("dhcp_renew_after_wifi_recoveries", 2))
             )
-            reset_adapter = force_wifi_reconnect and recovery_number >= max(
-                1, int(config["wifi"].get("adapter_reset_after_wifi_recoveries", 5))
-            )
             try:
                 attempt = ensure_connected(
                     config,
                     force_wifi_reconnect=force_wifi_reconnect,
                     renew_dhcp=renew_dhcp,
-                    reset_adapter=reset_adapter,
                     fast_network_check=fast_network_check,
                 )
             except Exception as error:  # 保活程序不能因一次网络错误退出

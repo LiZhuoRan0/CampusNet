@@ -12,7 +12,7 @@
 
 1. 确认 Windows 实际已关联到 `BIT-Web`（不是只看连接命令是否提交成功）；
 2. 若 Windows 软件无线电被任务栏 Wi-Fi 开关关闭，自动开启无线电，再连接已保存的 `BIT-Web` 配置；
-3. 断开并重新关联已保存的 Wi-Fi 配置；
+3. 模拟任务栏 Wi-Fi 开关“关→开”，再重新连接已保存的 Wi-Fi 配置；
 4. 第二轮 Wi-Fi 恢复起，重新获取 DHCP 地址；
 5. 长期失败时，尝试无弹窗地重置无线适配器；若 Windows 策略不允许普通用户重置，程序会记录失败并继续其他恢复步骤，不会弹窗或退出；
 6. Wi-Fi 的物理重连采用 30 秒、60 秒、120 秒、最多 300 秒的退避，避免校园网门户故障时反复断网；认证请求本身仍按 10 秒间隔继续。
@@ -120,10 +120,9 @@ netsh wlan connect name=BIT-Web
 
 `wifi` 中的恢复参数可以按需调整；通常无需修改：
 
-- `reconnect_after_portal_failures`：连续几次门户传输失败后启动一次 Wi-Fi 物理恢复，默认 3。
+- `reconnect_after_portal_failures`：连续几次门户传输失败后启动一次 Wi-Fi 物理恢复，默认 2。
 - `wifi_reconnect_cooldown_seconds` / `max_wifi_reconnect_cooldown_seconds`：物理恢复的初始与最大退避时间，默认 30 / 300 秒。
 - `dhcp_renew_after_wifi_recoveries`：第几次物理恢复起续租 DHCP，默认 2。
-- `adapter_reset_after_wifi_recoveries`：第几次物理恢复起尝试重置无线适配器，默认 5；若系统拒绝权限，会自动跳过。
 
 首次发现断网时，程序仍使用两个外网探测地址确认；后续恢复重试改用一个最多 2 秒的快速探测，然后直接认证，避免每轮都等待两个外网请求超时。`network_check.retry_timeout_seconds` 可调整这个快速探测的超时，默认 2 秒。
 

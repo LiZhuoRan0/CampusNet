@@ -2,11 +2,10 @@
   "wifi": {
     "ssid": "BIT-Web",
     "connect_wait_seconds": 20,
-    "reconnect_after_portal_failures": 3,
+    "reconnect_after_portal_failures": 2,
     "wifi_reconnect_cooldown_seconds": 30,
     "max_wifi_reconnect_cooldown_seconds": 300,
-    "dhcp_renew_after_wifi_recoveries": 2,
-    "adapter_reset_after_wifi_recoveries": 5
+    "dhcp_renew_after_wifi_recoveries": 2
   },
   "portal": {
     "service_url": "http://10.0.0.55",

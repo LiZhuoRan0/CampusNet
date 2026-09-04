@@ -50,12 +50,12 @@ class SRunEncodingTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 2)
 
-    def test_forced_reconnect_resets_wifi_before_checking_network(self) -> None:
+    def test_forced_reconnect_cycles_wifi_radio_before_checking_network(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
         connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
         with (
             patch("campusnet.wifi_status", return_value=connected),
-            patch("campusnet.disconnect_wifi", return_value=True) as disconnect,
+            patch("campusnet.cycle_wifi_radio", return_value=True) as cycle_radio,
             patch("campusnet.connect_wifi", return_value=True) as connect,
             patch("campusnet.wait_for_wifi", return_value=connected),
             patch("campusnet.internet_available", return_value=True),
@@ -66,8 +66,26 @@ class SRunEncodingTests(unittest.TestCase):
             result = campusnet.ensure_connected(config, force_wifi_reconnect=True)
 
         self.assertTrue(result.healthy)
-        disconnect.assert_called_once_with()
+        cycle_radio.assert_called_once_with()
         connect.assert_called_once_with("BIT-Web")
+
+    def test_forced_reconnect_falls_back_to_disconnect_when_radio_cycle_fails(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        with (
+            patch("campusnet.wifi_status", return_value=connected),
+            patch("campusnet.cycle_wifi_radio", return_value=False),
+            patch("campusnet.disconnect_wifi", return_value=True) as disconnect,
+            patch("campusnet.connect_wifi", return_value=True),
+            patch("campusnet.wait_for_wifi", return_value=connected),
+            patch("campusnet.internet_available", return_value=True),
+            patch("campusnet.time.sleep"),
+            patch.object(campusnet.LOG, "warning"),
+            patch.object(campusnet.LOG, "info"),
+        ):
+            result = campusnet.ensure_connected(config, force_wifi_reconnect=True)
+        self.assertTrue(result.healthy)
+        disconnect.assert_called_once_with()
 
     def test_wait_for_wifi_requires_connected_state_and_matching_ssid(self) -> None:
         statuses = [
@@ -100,6 +118,7 @@ class SRunEncodingTests(unittest.TestCase):
         connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
         with (
             patch("campusnet.wifi_status", return_value=connected),
+            patch("campusnet.cycle_wifi_radio", return_value=True),
             patch("campusnet.disconnect_wifi", return_value=True),
             patch("campusnet.connect_wifi", return_value=True),
             patch("campusnet.wait_for_wifi", return_value=connected),
