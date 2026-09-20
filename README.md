@@ -60,11 +60,69 @@ powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
 
 该命令会出现一次 Windows UAC 确认：确认后，程序会以当前用户的“最高权限”计划任务在登录时自动后台运行，且立即替换当前的普通后台实例。这样当 Wi-Fi 无线电重置不足时，程序也可自行重置无线适配器；日常运行不会弹窗。
 
-## 停止自动运行
+## 计划任务管理命令
+
+以下命令均在 PowerShell 中执行。`CampusNetAutoLogin` 是本项目创建的 Windows 计划任务名；停止、禁用、启用或重新启动都不会删除 `config.json`、账号密码或日志。
+
+### 临时停止当前自动重连
+
+```powershell
+Stop-ScheduledTask -TaskName CampusNetAutoLogin
+```
+
+这会停止当前后台的 `pythonw.exe` 进程；计划任务仍保留，下一次登录 Windows 会再次自动启动。
+
+### 立即恢复已停止的自动重连
+
+```powershell
+Start-ScheduledTask -TaskName CampusNetAutoLogin
+```
+
+### 暂停开机/登录自动启动
+
+```powershell
+Disable-ScheduledTask -TaskName CampusNetAutoLogin
+```
+
+该任务将不再在后续登录 Windows 时运行；如当前进程仍在运行，请先执行“临时停止”命令。
+
+### 恢复开机/登录自动启动
+
+```powershell
+Enable-ScheduledTask -TaskName CampusNetAutoLogin
+Start-ScheduledTask -TaskName CampusNetAutoLogin
+```
+
+第一条恢复登录时自动启动，第二条立即启动，无需等待下次登录。
+
+### 查看当前任务状态
+
+```powershell
+Get-ScheduledTask -TaskName CampusNetAutoLogin
+Get-ScheduledTaskInfo -TaskName CampusNetAutoLogin
+```
+
+第一条显示任务是否正在运行；第二条显示上一次运行时间和结果。任务实际运行的程序为：
+
+```text
+pythonw.exe "G:\D_Lizhuoran\Code\CampusNet\campusnet.py"
+```
+
+### 彻底卸载自动运行
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\uninstall_autostart.ps1
 ```
+
+该脚本会请求一次 UAC 管理员确认，随后停止当前进程、删除 `CampusNetAutoLogin` 计划任务及旧启动项。项目文件、`config.json` 与日志仍会保留。
+
+### 重新安装自动运行
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\install_autostart.ps1
+```
+
+该脚本会创建或更新最高权限任务，并立即启动它。
 
 运行日志写入 `campusnet.log`，其中不会记录账号或密码。日志按天轮转，并自动删除 30 天前的内容。
 
