@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BIT-Web 自动保活与深澜（SRun）认证工具（仅使用 Python 标准库）。"""
+"""北理校园 Wi-Fi 自动保活与深澜（SRun）认证工具（仅使用 Python 标准库）。"""
 
 from __future__ import annotations
 
@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import re
 import subprocess
 import sys
@@ -28,7 +29,9 @@ from urllib.request import Request, urlopen
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "campusnet.log"
+PREFERRED_WIFI_PATH = APP_DIR / "preferred_wifi.txt"
 LOG_RETENTION_DAYS = 30
+CAMPUS_SSIDS = ("BIT-Web", "BIT-Mobile")
 STANDARD_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
 BIT_SRUN_BASE64_ALPHABET = "LVoJPiCN2R8G90yg+hmFHuacZ1OWMnrsSTXkYpUq/3dlbfKwv6xztjI7DeBE45QA"
 
@@ -152,6 +155,35 @@ def load_config() -> dict[str, Any]:
     if not credentials.get("username") or not credentials.get("password_encrypted"):
         raise RuntimeError("config.json 缺少 credentials.username 或 credentials.password_encrypted")
     return config
+
+
+def preferred_wifi(config: dict[str, Any]) -> str:
+    """读取持久选择；旧版配置仍以 wifi.ssid 作为初始值。"""
+    default = str(config["wifi"]["ssid"])
+    if default not in CAMPUS_SSIDS:
+        raise RuntimeError(f"config.json 中 wifi.ssid 不受支持：{default}")
+    if not PREFERRED_WIFI_PATH.exists():
+        return default
+    selected = PREFERRED_WIFI_PATH.read_text(encoding="utf-8").strip()
+    if selected not in CAMPUS_SSIDS:
+        raise RuntimeError("preferred_wifi.txt 不是受支持的校园网名称")
+    return selected
+
+
+def save_preferred_wifi(ssid: str) -> None:
+    """原子保存选择，避免守护进程读取到写了一半的文件。"""
+    if ssid not in CAMPUS_SSIDS:
+        raise ValueError(f"不支持的校园网名称：{ssid}")
+    temporary = PREFERRED_WIFI_PATH.with_name(f"{PREFERRED_WIFI_PATH.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(ssid + "\n", encoding="utf-8")
+        os.replace(temporary, PREFERRED_WIFI_PATH)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def config_for_wifi(config: dict[str, Any], ssid: str) -> dict[str, Any]:
+    return {**config, "wifi": {**config["wifi"], "ssid": ssid}}
 
 
 def jsonp(url: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -559,6 +591,7 @@ def ensure_connected(
     force_wifi_reconnect: bool = False,
     renew_dhcp: bool = False,
     fast_network_check: bool = False,
+    switch_now: bool = False,
 ) -> ConnectionAttempt:
     ssid = str(config["wifi"]["ssid"])
     status = wifi_status()
@@ -586,12 +619,13 @@ def ensure_connected(
         if status is None:
             return ConnectionAttempt(False)
 
-    # 若用户正在使用其他且可正常联网的 Wi-Fi，不抢占连接；其余情况切换到 BIT-Web。
+    # 两个校园网之间服从用户保存的选择。对其他正常联网的 Wi-Fi 保持原有
+    # 行为；显式切换命令则立即连接所选校园网。
     elif active_ssid != ssid:
-        if internet_available(config):
+        if not switch_now and active_ssid not in CAMPUS_SSIDS and internet_available(config):
             LOG.info("当前连接 %s，网络正常。", active_ssid)
             return ConnectionAttempt(True)
-        LOG.warning("当前连接 %s 但网络不可用，开始连接 %s。", active_ssid, ssid)
+        LOG.warning("当前连接 %s，开始连接已选择的校园网 %s。", active_ssid, ssid)
         if not connect_wifi(ssid):
             return ConnectionAttempt(False)
         status = wait_for_wifi(ssid, int(config["wifi"].get("connect_wait_seconds", 20)))
@@ -636,14 +670,23 @@ def ensure_connected(
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="BIT-Web 自动保活与登录")
+    parser = argparse.ArgumentParser(description="北理校园 Wi-Fi 自动保活与登录")
     parser.add_argument("--once", action="store_true", help="仅检测并修复一次")
+    parser.add_argument("--switch", choices=CAMPUS_SSIDS, help="保存首选校园网并立即连接")
     args = parser.parse_args()
     try:
+        if args.switch:
+            config = load_config()
+            save_preferred_wifi(args.switch)
+            LOG.info("已选择 %s；后续自动重连也将使用这个校园网。", args.switch)
+            attempt = ensure_connected(config_for_wifi(config, args.switch), switch_now=True)
+            return 0 if attempt.healthy else 1
         if not acquire_single_instance():
             LOG.info("已有 CampusNet 实例在运行，本次启动退出。")
             return 0
         config = load_config()
+        selected_ssid = preferred_wifi(config)
+        LOG.info("当前首选校园网：%s。", selected_ssid)
         normal_interval = max(10, int(config.get("check_interval_seconds", 30)))
         retry_interval = max(1, int(config.get("retry_interval_seconds", 10)))
         reconnect_threshold = max(1, int(config["wifi"].get("reconnect_after_portal_failures", 3)))
@@ -653,6 +696,18 @@ def main() -> int:
         outage_started_at: float | None = None
         while True:
             attempt_started = time.monotonic()
+            try:
+                new_ssid = preferred_wifi(config)
+            except (OSError, UnicodeError, RuntimeError) as error:
+                LOG.warning("读取首选校园网失败，本轮沿用 %s：%s", selected_ssid, error)
+                new_ssid = selected_ssid
+            if new_ssid != selected_ssid:
+                LOG.info("首选校园网已从 %s 切换为 %s。", selected_ssid, new_ssid)
+                selected_ssid = new_ssid
+                portal_transport_failures = 0
+                wifi_recovery_count = 0
+                next_wifi_recovery_at = 0.0
+                outage_started_at = None
             force_wifi_reconnect = (
                 portal_transport_failures >= reconnect_threshold and attempt_started >= next_wifi_recovery_at
             )
@@ -665,7 +720,7 @@ def main() -> int:
             )
             try:
                 attempt = ensure_connected(
-                    config,
+                    config_for_wifi(config, selected_ssid),
                     force_wifi_reconnect=force_wifi_reconnect,
                     renew_dhcp=renew_dhcp,
                     fast_network_check=fast_network_check,

@@ -1,5 +1,6 @@
 import sys
 import subprocess
+import tempfile
 import unittest
 from http.client import RemoteDisconnected
 from pathlib import Path
@@ -60,6 +61,65 @@ class SRunEncodingTests(unittest.TestCase):
             self.assertFalse(campusnet.internet_available(config, fast=True))
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 2)
+
+    def test_wifi_choice_persists_without_changing_config(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web"}}
+        with tempfile.TemporaryDirectory() as directory:
+            with patch.object(campusnet, "PREFERRED_WIFI_PATH", Path(directory) / "preferred_wifi.txt"):
+                self.assertEqual(campusnet.preferred_wifi(config), "BIT-Web")
+                campusnet.save_preferred_wifi("BIT-Mobile")
+                self.assertEqual(campusnet.preferred_wifi(config), "BIT-Mobile")
+                self.assertEqual(config["wifi"]["ssid"], "BIT-Web")
+                with self.assertRaises(ValueError):
+                    campusnet.save_preferred_wifi("other")
+
+    def test_selected_mobile_replaces_web_even_when_web_is_healthy(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Mobile", "connect_wait_seconds": 1}}
+        web = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        mobile = campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)
+        with (
+            patch("campusnet.wifi_status", return_value=web),
+            patch("campusnet.connect_wifi", return_value=True) as connect,
+            patch("campusnet.wait_for_wifi", return_value=mobile),
+            patch("campusnet.internet_available", return_value=True),
+        ):
+            result = campusnet.ensure_connected(config)
+        self.assertTrue(result.healthy)
+        connect.assert_called_once_with("BIT-Mobile")
+
+    def test_mobile_uses_same_portal_when_connected_but_offline(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Mobile", "connect_wait_seconds": 1}}
+        mobile = campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)
+        with (
+            patch("campusnet.wifi_status", return_value=mobile),
+            patch("campusnet.internet_available", side_effect=[False, True]),
+            patch("campusnet.srun_login", return_value=(True, "登录成功")) as login,
+            patch("campusnet.time.sleep"),
+        ):
+            result = campusnet.ensure_connected(config)
+        self.assertTrue(result.healthy)
+        login.assert_called_once_with(config)
+
+    def test_background_uses_new_wifi_choice_without_restart(self) -> None:
+        config = {
+            "wifi": {"ssid": "BIT-Web", "reconnect_after_portal_failures": 2},
+            "check_interval_seconds": 30,
+            "retry_interval_seconds": 10,
+        }
+        with (
+            patch("campusnet.acquire_single_instance", return_value=True),
+            patch("campusnet.load_config", return_value=config),
+            patch("campusnet.preferred_wifi", side_effect=["BIT-Web", "BIT-Web", "BIT-Mobile"]),
+            patch("campusnet.ensure_connected", return_value=campusnet.ConnectionAttempt(True)) as ensure,
+            patch("campusnet.time.sleep", side_effect=[None, KeyboardInterrupt]),
+            patch.object(sys, "argv", ["campusnet.py"]),
+        ):
+            with self.assertRaises(KeyboardInterrupt):
+                campusnet.main()
+        self.assertEqual(
+            [call.args[0]["wifi"]["ssid"] for call in ensure.call_args_list],
+            ["BIT-Web", "BIT-Mobile"],
+        )
 
     def test_forced_reconnect_cycles_wifi_radio_before_checking_network(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
@@ -220,6 +280,7 @@ class SRunEncodingTests(unittest.TestCase):
         with (
             patch("campusnet.acquire_single_instance", return_value=True),
             patch("campusnet.load_config", return_value=config),
+            patch("campusnet.preferred_wifi", return_value="BIT-Web"),
             patch("campusnet.ensure_connected", side_effect=attempts) as ensure,
             patch("campusnet.wifi_recovery_cooldown") as cooldown,
             patch("campusnet.wifi_diagnostic_summary", return_value="状态=已连接"),

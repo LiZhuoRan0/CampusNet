@@ -1,17 +1,17 @@
-# BIT-Web 自动重连与登录
+# BIT-Web / BIT-Mobile 自动重连与登录
 
 这是一个无需第三方依赖的 Windows Python 程序。它每 30 秒检查一次真实外网连通性；不可用时会：
 
-1. 连接已保存的 `BIT-Web` Wi-Fi 配置；
+1. 连接已选择的 `BIT-Web` 或 `BIT-Mobile` Wi-Fi 配置；
 2. 按北京理工大学深澜（SRun）门户的 challenge 加密流程登录；
 3. 重新检查网络；若仍不可用，每 10 秒重试，直至恢复。
 
 认证中的 `info` 字段使用北理门户配置的自定义 Base64 字母表；相关值可在 `config.json` 的 `portal.base64_alphabet` 中覆盖。
 
-如果 SSID 仍显示为 `BIT-Web`，但校园网门户连续 2 次中断连接，程序会自动进行分层恢复，并继续认证。该过程只使用 Windows 本地 Wi-Fi 配置、DHCP 和校园网内网，不依赖外网：
+如果 SSID 仍显示为已选择的校园网，但校园网门户连续 2 次中断连接，程序会自动进行分层恢复，并继续认证。该过程只使用 Windows 本地 Wi-Fi 配置、DHCP 和校园网内网，不依赖外网：
 
-1. 确认 Windows 实际已关联到 `BIT-Web`（不是只看连接命令是否提交成功）；
-2. 若 Windows 软件无线电被任务栏 Wi-Fi 开关关闭，自动开启无线电，再连接已保存的 `BIT-Web` 配置；
+1. 确认 Windows 实际已关联到已选择的校园网（不是只看连接命令是否提交成功）；
+2. 若 Windows 软件无线电被任务栏 Wi-Fi 开关关闭，自动开启无线电，再连接已保存的 Wi-Fi 配置；
 3. 模拟任务栏 Wi-Fi 开关“关→开”，再重新连接已保存的 Wi-Fi 配置；
 4. 第二轮 Wi-Fi 恢复起，重新获取 DHCP 地址；
 5. 若无线电重置失败，使用最高权限计划任务无弹窗地禁用再启用无线适配器；若硬件或系统仍拒绝，才退回普通断开并重新关联；
@@ -19,7 +19,7 @@
 
 ## 首次使用
 
-请确认 Windows 已至少手动连接过一次 `BIT-Web`，使系统保存了该 Wi-Fi 配置。
+请确认 Windows 已至少手动连接过要使用的 `BIT-Web` 或 `BIT-Mobile`，使系统保存了对应的 Wi-Fi 配置。`BIT-Mobile` 还需要 Windows 能使用其企业 Wi-Fi 凭据完成连接。
 
 先复制 `config.example.json` 为 `config.json`，再配置 `config.json` 里的 `credentials`：
 
@@ -49,6 +49,32 @@ python .\campusnet.py --once
 ```
 
 首次运行会把 `config.json` 中的明文密码替换为 Windows DPAPI 密文，只能由当前 Windows 用户解密。
+
+## 选择要自动重连的校园网
+
+在本项目目录的 PowerShell 中执行以下命令；它会保存选择并立即尝试连接：
+
+```powershell
+.\switch_wifi.bat BIT-Mobile
+```
+
+以后想切回 `BIT-Web`：
+
+```powershell
+.\switch_wifi.bat BIT-Web
+```
+
+选择保存在本机的 `preferred_wifi.txt`，不会进入 GitHub；无需修改包含密码的 `config.json`，也无需重新安装计划任务。后台程序会在下一轮检测时读取选择（正常情况下最多约 30 秒），以后断网也只重连选定的校园网。`config.json` 的 `wifi.ssid` 是尚未做过选择时的初始值。
+
+两种校园网使用同一流程：先用 Windows 保存的 Wi-Fi 配置连接，检查外网；检查不通时尝试 `config.json` 中的校园网门户认证及后续恢复。普通联网检测不能判断 VPN 某个节点是否可用，所以切换由你决定，程序不会因 VPN 节点失效自行换网。手动连接了其他正常的非校园 Wi-Fi 时，后台程序沿用原有行为，不强行抢占；显式运行上述切换命令会立即切到所选校园网。
+
+如果计划任务已暂停，上述命令仍会执行一次连接并保存选择，但不会启动持续监控。要恢复后台自动重连，再执行：
+
+```powershell
+Start-ScheduledTask -TaskName CampusNetAutoLogin
+```
+
+若此前禁用了该计划任务，请先运行 `Enable-ScheduledTask -TaskName CampusNetAutoLogin`。
 
 ## 重新安装
 
@@ -145,14 +171,14 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
         │
         └─ 异常
             │
-            ├─ 检查当前 Wi‑Fi 是否为 BIT-Web
-            │     └─ 不是 → 若软件无线电关闭则自动开启，再连接 BIT-Web
+            ├─ 检查当前 Wi‑Fi 是否为已选择的校园网
+            │     └─ 不是 → 若软件无线电关闭则自动开启，再连接所选校园网
             │
-            ├─ 等待 Windows 确认已实际关联 BIT-Web
+            ├─ 等待 Windows 确认已实际关联所选校园网
             │
             ├─ 多轮失败时续租 DHCP；无线电重置失败时以最高权限重置无线适配器
             │
-            ├─ 已连接 BIT-Web 后，向校园网认证服务器请求 challenge
+            ├─ 已连接所选校园网后，若外网仍不通则向校园网认证服务器请求 challenge
             │
             ├─ 用账号、密码和 challenge 按 SRun 规则生成加密登录参数
             │
@@ -166,17 +192,18 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
 - Microsoft 的 `connecttest.txt`，必须返回预期文字。
 - Google 的 `generate_204`，必须返回 HTTP 204。
 
-因此即使电脑还连着 `BIT-Web`、但校园网认证已经过期或网络无外网，程序也会识别为异常并重新登录。
+因此即使电脑还连着所选校园网、但校园网认证已经过期或网络无外网，程序也会识别为异常并重新登录。
 
 连接 Wi‑Fi 的部分调用 Windows 自带命令：
 
 ```text
 netsh wlan connect name=BIT-Web
+# 或 netsh wlan connect name=BIT-Mobile
 ```
 
-这要求 Windows 已经保存了 `BIT-Web` 的 Wi‑Fi 配置。认证成功或失败、连接失败等情况都会写入 `campusnet.log`。
+这要求 Windows 已经保存了对应的 Wi-Fi 配置。认证成功或失败、连接失败等情况都会写入 `campusnet.log`。
 
-`netsh wlan connect` 使用的是本机已保存的 Wi-Fi 配置，而认证接口位于校园网内网 `10.0.0.55`；两者均不依赖外网可用。
+`netsh wlan connect` 使用的是本机已保存的 Wi-Fi 配置，而认证接口位于校园网内网 `10.0.0.55`；两者均不依赖外网可用。对于 `BIT-Mobile`，Windows 还须先完成该 Wi-Fi 自身的企业认证。
 
 `wifi` 中的恢复参数可以按需调整；通常无需修改：
 
@@ -186,4 +213,4 @@ netsh wlan connect name=BIT-Web
 
 首次发现断网时，程序仍使用两个外网探测地址确认；后续恢复重试改用一个最多 2 秒的快速探测，然后直接认证，避免每轮都等待两个外网请求超时。`network_check.retry_timeout_seconds` 可调整这个快速探测的超时，默认 2 秒。
 
-若电脑未连接任何 Wi-Fi，程序会跳过外网探测，立即执行本地 `netsh` 命令连接 `BIT-Web`。若正连接其他且能正常联网的 Wi-Fi，则不会抢占该连接。
+若电脑未连接任何 Wi-Fi，程序会跳过外网探测，立即执行本地 `netsh` 命令连接已选择的校园网。若正连接其他且能正常联网的非校园 Wi-Fi，则不会抢占该连接；在 `BIT-Web` 和 `BIT-Mobile` 之间则始终以保存的选择为准。

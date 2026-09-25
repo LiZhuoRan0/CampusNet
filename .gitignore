@@ -1,3 +1,5 @@
 campusnet.log*
 __pycache__/
 config.json
+preferred_wifi.txt
+preferred_wifi.txt.*.tmp
