@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from ctypes import wintypes
 from dataclasses import dataclass
@@ -30,6 +31,7 @@ APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "config.json"
 LOG_PATH = APP_DIR / "campusnet.log"
 PREFERRED_WIFI_PATH = APP_DIR / "preferred_wifi.txt"
+PENDING_SWITCH_PATH = APP_DIR / "pending_switch.txt"
 LOG_RETENTION_DAYS = 30
 CAMPUS_SSIDS = ("BIT-Web", "BIT-Mobile")
 STANDARD_BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -170,20 +172,84 @@ def preferred_wifi(config: dict[str, Any]) -> str:
     return selected
 
 
-def save_preferred_wifi(ssid: str) -> None:
-    """原子保存选择，避免守护进程读取到写了一半的文件。"""
+def save_wifi_choice(path: Path, ssid: str) -> None:
+    """原子保存 SSID，避免守护进程读取到写了一半的文件。"""
     if ssid not in CAMPUS_SSIDS:
         raise ValueError(f"不支持的校园网名称：{ssid}")
-    temporary = PREFERRED_WIFI_PATH.with_name(f"{PREFERRED_WIFI_PATH.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f"{path.name}.{os.getpid()}.tmp")
     try:
         temporary.write_text(ssid + "\n", encoding="utf-8")
-        os.replace(temporary, PREFERRED_WIFI_PATH)
+        os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
 
 
+def save_preferred_wifi(ssid: str) -> None:
+    save_wifi_choice(PREFERRED_WIFI_PATH, ssid)
+
+
+def pending_wifi_switch() -> str | None:
+    try:
+        return PENDING_SWITCH_PATH.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as error:
+        LOG.warning("读取 Wi-Fi 切换提示状态失败：%s", error)
+        return None
+
+
+def clear_pending_wifi_switch(ssid: str) -> bool:
+    if pending_wifi_switch() == ssid:
+        try:
+            PENDING_SWITCH_PATH.unlink(missing_ok=True)
+            return True
+        except OSError as error:
+            LOG.warning("清除 Wi-Fi 切换提示状态失败：%s", error)
+    return False
+
+
 def config_for_wifi(config: dict[str, Any], ssid: str) -> dict[str, Any]:
     return {**config, "wifi": {**config["wifi"], "ssid": ssid}}
+
+
+def notify_wifi_switch_success(ssid: str) -> bool:
+    """从后台计划任务显示一次非阻塞的 Windows 提示框。"""
+    def show_message() -> None:
+        try:
+            user32 = ctypes.WinDLL("user32", use_last_error=True)
+            message_box = user32.MessageBoxW
+            message_box.argtypes = (wintypes.HWND, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.UINT)
+            message_box.restype = ctypes.c_int
+            # MB_ICONINFORMATION | MB_SETFOREGROUND | MB_TOPMOST
+            result = message_box(None, f"已切换到 {ssid}，网络连接正常。", "校园网自动重连", 0x50040)
+            if result == 0:
+                LOG.warning("显示 Wi-Fi 切换提示失败：%s", ctypes.WinError(ctypes.get_last_error()))
+        except Exception as error:
+            LOG.warning("显示 Wi-Fi 切换提示失败：%s", error)
+
+    try:
+        threading.Thread(target=show_message, name="CampusNetSwitchNotification", daemon=True).start()
+        return True
+    except Exception as error:
+        LOG.warning("启动 Wi-Fi 切换提示失败：%s", error)
+        return False
+
+
+def complete_pending_switch_notification(selected_ssid: str, healthy: bool) -> None:
+    """只在所选 SSID 已关联且外网正常时，消耗一次待提示的切换。"""
+    if not healthy or pending_wifi_switch() != selected_ssid:
+        return
+    try:
+        status = wifi_status()
+    except Exception as error:
+        LOG.warning("确认 Wi-Fi 切换状态失败，稍后重试提示：%s", error)
+        return
+    if not status.connected or status.ssid != selected_ssid:
+        return
+    if not notify_wifi_switch_success(selected_ssid):
+        return
+    if clear_pending_wifi_switch(selected_ssid):
+        LOG.info("已向桌面发送 %s 切换成功提示。", selected_ssid)
 
 
 def jsonp(url: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -678,6 +744,7 @@ def main() -> int:
         if args.switch:
             config = load_config()
             save_preferred_wifi(args.switch)
+            save_wifi_choice(PENDING_SWITCH_PATH, args.switch)
             LOG.info("已选择 %s；后续自动重连也将使用这个校园网。", args.switch)
             selected_config = config_for_wifi(config, args.switch)
             for attempt_number in range(1, 4):
@@ -685,6 +752,7 @@ def main() -> int:
                     selected_config, switch_now=True, fast_network_check=attempt_number > 1
                 )
                 if attempt.healthy:
+                    clear_pending_wifi_switch(args.switch)
                     LOG.info("已确认 %s 可以正常联网，本次切换成功。", args.switch)
                     return 0
                 if attempt_number < 3:
@@ -750,6 +818,7 @@ def main() -> int:
                 LOG.exception("本次检测出错：%s", error)
                 attempt = ConnectionAttempt(False)
             healthy = attempt.healthy
+            complete_pending_switch_notification(selected_ssid, healthy)
             if healthy:
                 if outage_started_at is not None:
                     LOG.info("网络已恢复；本次断网持续约 %.0f 秒。", time.monotonic() - outage_started_at)

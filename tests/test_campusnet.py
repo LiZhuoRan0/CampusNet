@@ -73,6 +73,40 @@ class SRunEncodingTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     campusnet.save_preferred_wifi("other")
 
+    def test_background_notifies_once_after_selected_wifi_is_online(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            pending_path = Path(directory) / "pending_switch.txt"
+            with (
+                patch.object(campusnet, "PENDING_SWITCH_PATH", pending_path),
+                patch("campusnet.wifi_status") as status,
+                patch("campusnet.notify_wifi_switch_success", return_value=True) as notify,
+            ):
+                campusnet.save_wifi_choice(pending_path, "BIT-Web")
+                status.return_value = campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)
+                campusnet.complete_pending_switch_notification("BIT-Web", True)
+                notify.assert_not_called()
+                campusnet.complete_pending_switch_notification("BIT-Web", False)
+                notify.assert_not_called()
+                status.return_value = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+                campusnet.complete_pending_switch_notification("BIT-Web", True)
+                campusnet.complete_pending_switch_notification("BIT-Web", True)
+                notify.assert_called_once_with("BIT-Web")
+                self.assertFalse(pending_path.exists())
+
+    def test_switch_notification_uses_nonblocking_windows_dialog(self) -> None:
+        with (
+            patch("campusnet.threading.Thread") as thread,
+            patch("campusnet.ctypes.WinDLL") as win_dll,
+        ):
+            win_dll.return_value.MessageBoxW.return_value = 1
+            campusnet.notify_wifi_switch_success("BIT-Web")
+            self.assertTrue(thread.call_args.kwargs["daemon"])
+            thread.return_value.start.assert_called_once_with()
+            thread.call_args.kwargs["target"]()
+            win_dll.return_value.MessageBoxW.assert_called_once_with(
+                None, "已切换到 BIT-Web，网络连接正常。", "校园网自动重连", 0x50040
+            )
+
     def test_selected_mobile_replaces_web_even_when_web_is_healthy(self) -> None:
         config = {"wifi": {"ssid": "BIT-Mobile", "connect_wait_seconds": 1}}
         web = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
@@ -126,6 +160,8 @@ class SRunEncodingTests(unittest.TestCase):
         with (
             patch("campusnet.load_config", return_value=config),
             patch("campusnet.save_preferred_wifi") as save,
+            patch("campusnet.save_wifi_choice"),
+            patch("campusnet.clear_pending_wifi_switch"),
             patch(
                 "campusnet.ensure_connected",
                 side_effect=[campusnet.ConnectionAttempt(False), campusnet.ConnectionAttempt(True)],
@@ -145,6 +181,7 @@ class SRunEncodingTests(unittest.TestCase):
         with (
             patch("campusnet.load_config", return_value=config),
             patch("campusnet.save_preferred_wifi") as save,
+            patch("campusnet.save_wifi_choice"),
             patch("campusnet.ensure_connected", return_value=campusnet.ConnectionAttempt(False)) as ensure,
             patch("campusnet.wifi_status", return_value=campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)),
             patch("campusnet.time.sleep"),
