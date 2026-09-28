@@ -121,6 +121,20 @@ class SRunEncodingTests(unittest.TestCase):
         self.assertTrue(result.healthy)
         connect.assert_called_once_with("BIT-Mobile")
 
+    def test_explicit_switch_replaces_healthy_noncampus_wifi(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
+        other = campusnet.WifiStatus("WLAN 2", "629_GZ_Printer", True)
+        web = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
+        with (
+            patch("campusnet.wifi_status", return_value=other),
+            patch("campusnet.connect_wifi", return_value=True) as connect,
+            patch("campusnet.wait_for_wifi", return_value=web),
+            patch("campusnet.internet_available", return_value=True),
+        ):
+            result = campusnet.ensure_connected(config, switch_now=True)
+        self.assertTrue(result.healthy)
+        connect.assert_called_once_with("BIT-Web")
+
     def test_mobile_uses_same_portal_when_connected_but_offline(self) -> None:
         config = {"wifi": {"ssid": "BIT-Mobile", "connect_wait_seconds": 1}}
         mobile = campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)
@@ -144,6 +158,8 @@ class SRunEncodingTests(unittest.TestCase):
             patch("campusnet.acquire_single_instance", return_value=True),
             patch("campusnet.load_config", return_value=config),
             patch("campusnet.preferred_wifi", side_effect=["BIT-Web", "BIT-Web", "BIT-Mobile"]),
+            patch("campusnet.pending_wifi_switch", return_value="BIT-Mobile"),
+            patch("campusnet.complete_pending_switch_notification"),
             patch("campusnet.ensure_connected", return_value=campusnet.ConnectionAttempt(True)) as ensure,
             patch("campusnet.time.sleep", side_effect=[None, KeyboardInterrupt]),
             patch.object(sys, "argv", ["campusnet.py"]),
@@ -154,6 +170,7 @@ class SRunEncodingTests(unittest.TestCase):
             [call.args[0]["wifi"]["ssid"] for call in ensure.call_args_list],
             ["BIT-Web", "BIT-Mobile"],
         )
+        self.assertEqual([call.kwargs["switch_now"] for call in ensure.call_args_list], [False, True])
 
     def test_switch_command_retries_a_transient_windows_connection_failure(self) -> None:
         config = {"wifi": {"ssid": "BIT-Mobile"}}

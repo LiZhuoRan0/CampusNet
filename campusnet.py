@@ -813,6 +813,7 @@ def main() -> int:
                     force_wifi_reconnect=force_wifi_reconnect,
                     renew_dhcp=renew_dhcp,
                     fast_network_check=fast_network_check,
+                    switch_now=pending_wifi_switch() == selected_ssid,
                 )
             except Exception as error:  # 保活程序不能因一次网络错误退出
                 LOG.exception("本次检测出错：%s", error)
