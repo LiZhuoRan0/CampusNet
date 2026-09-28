@@ -52,7 +52,7 @@ python .\campusnet.py --once
 
 ## 选择要自动重连的校园网
 
-在本项目目录的 PowerShell 中执行以下命令；它会保存选择并立即尝试连接：
+在本项目目录的 PowerShell 中执行以下命令；它会保存选择并立即尝试连接。若 Windows 暂时拒绝连接，会间隔 3 秒再试，最多尝试 3 次：
 
 ```powershell
 .\switch_wifi.bat BIT-Mobile
@@ -75,6 +75,8 @@ Start-ScheduledTask -TaskName CampusNetAutoLogin
 ```
 
 若此前禁用了该计划任务，请先运行 `Enable-ScheduledTask -TaskName CampusNetAutoLogin`。
+
+如果命令最终提示“本次尚未连接”，它只表示这几次即时尝试未成功；首选网络仍已保存。正在运行的后台任务会继续尝试。可以用 `netsh wlan show interfaces` 查看当前 SSID，并查看 `campusnet.log` 确认后续结果。
 
 ## 重新安装
 

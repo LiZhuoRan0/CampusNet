@@ -679,8 +679,29 @@ def main() -> int:
             config = load_config()
             save_preferred_wifi(args.switch)
             LOG.info("已选择 %s；后续自动重连也将使用这个校园网。", args.switch)
-            attempt = ensure_connected(config_for_wifi(config, args.switch), switch_now=True)
-            return 0 if attempt.healthy else 1
+            selected_config = config_for_wifi(config, args.switch)
+            for attempt_number in range(1, 4):
+                attempt = ensure_connected(
+                    selected_config, switch_now=True, fast_network_check=attempt_number > 1
+                )
+                if attempt.healthy:
+                    LOG.info("已确认 %s 可以正常联网，本次切换成功。", args.switch)
+                    return 0
+                if attempt_number < 3:
+                    LOG.warning("本次连接尚未成功，3 秒后重试（%s/3）。", attempt_number + 1)
+                    time.sleep(3)
+            status = wifi_status()
+            if status.connected and status.ssid == args.switch:
+                LOG.warning(
+                    "已连接 %s，但尚未确认外网恢复；选择已保存。若后台任务运行，它会继续认证。",
+                    args.switch,
+                )
+            else:
+                LOG.warning(
+                    "本次尚未连接到 %s（当前 Wi-Fi：%s）；选择已保存。若后台任务运行，它会继续重试。",
+                    args.switch, status.ssid if status.connected else "无",
+                )
+            return 1
         if not acquire_single_instance():
             LOG.info("已有 CampusNet 实例在运行，本次启动退出。")
             return 0

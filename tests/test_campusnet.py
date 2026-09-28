@@ -121,6 +121,42 @@ class SRunEncodingTests(unittest.TestCase):
             ["BIT-Web", "BIT-Mobile"],
         )
 
+    def test_switch_command_retries_a_transient_windows_connection_failure(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Mobile"}}
+        with (
+            patch("campusnet.load_config", return_value=config),
+            patch("campusnet.save_preferred_wifi") as save,
+            patch(
+                "campusnet.ensure_connected",
+                side_effect=[campusnet.ConnectionAttempt(False), campusnet.ConnectionAttempt(True)],
+            ) as ensure,
+            patch("campusnet.time.sleep") as sleep,
+            patch.object(sys, "argv", ["campusnet.py", "--switch", "BIT-Web"]),
+        ):
+            result = campusnet.main()
+        self.assertEqual(result, 0)
+        save.assert_called_once_with("BIT-Web")
+        self.assertEqual(ensure.call_count, 2)
+        self.assertTrue(all(call.args[0]["wifi"]["ssid"] == "BIT-Web" for call in ensure.call_args_list))
+        sleep.assert_called_once_with(3)
+
+    def test_switch_command_reports_saved_choice_if_all_immediate_attempts_fail(self) -> None:
+        config = {"wifi": {"ssid": "BIT-Mobile"}}
+        with (
+            patch("campusnet.load_config", return_value=config),
+            patch("campusnet.save_preferred_wifi") as save,
+            patch("campusnet.ensure_connected", return_value=campusnet.ConnectionAttempt(False)) as ensure,
+            patch("campusnet.wifi_status", return_value=campusnet.WifiStatus("WLAN 2", "BIT-Mobile", True)),
+            patch("campusnet.time.sleep"),
+            patch.object(campusnet.LOG, "warning") as warning,
+            patch.object(sys, "argv", ["campusnet.py", "--switch", "BIT-Web"]),
+        ):
+            result = campusnet.main()
+        self.assertEqual(result, 1)
+        save.assert_called_once_with("BIT-Web")
+        self.assertEqual(ensure.call_count, 3)
+        self.assertIn("选择已保存", warning.call_args.args[0])
+
     def test_forced_reconnect_cycles_wifi_radio_before_checking_network(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web", "connect_wait_seconds": 1}}
         connected = campusnet.WifiStatus("WLAN 2", "BIT-Web", True)
