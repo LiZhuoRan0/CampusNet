@@ -23,7 +23,7 @@ from logging.handlers import TimedRotatingFileHandler
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -631,25 +631,91 @@ def wifi_recovery_cooldown(config: dict[str, Any], recovery_count: int) -> int:
     return min(maximum, base * (2 ** max(0, recovery_count - 1)))
 
 
-def internet_available(config: dict[str, Any], fast: bool = False) -> bool:
+def probe_label(url: str) -> str:
+    """日志里只显示探测点的主机名，避免完整 URL 把一行日志撑得过长。"""
+    try:
+        return urlsplit(url).hostname or url
+    except ValueError:
+        return url
+
+
+def _probe_once(probe: dict[str, Any], timeout_seconds: int) -> tuple[bool, float, str]:
+    """执行单个探测，返回（是否通过、耗时秒数、失败原因）。"""
+    started = time.monotonic()
+    try:
+        with urlopen(
+            Request(probe["url"], headers={"User-Agent": "CampusNet/1.0"}),
+            timeout=timeout_seconds,
+        ) as response:
+            expected_status = probe.get("expected_status")
+            expected_text = probe.get("expected_text")
+            if expected_status is None and expected_text is None:
+                return False, time.monotonic() - started, "缺少 expected_status/expected_text"
+            if expected_status is not None and response.status != expected_status:
+                return False, time.monotonic() - started, f"HTTP {response.status}（期望 {expected_status}）"
+            if expected_text is not None and expected_text not in response.read().decode(
+                "utf-8", errors="replace"
+            ):
+                return False, time.monotonic() - started, "正文与预期不符"
+            return True, time.monotonic() - started, ""
+    except HTTPError as error:
+        return False, time.monotonic() - started, f"HTTP {error.code}"
+    except (URLError, OSError, TimeoutError) as error:
+        return False, time.monotonic() - started, str(getattr(error, "reason", error))
+
+
+def probe_detail_summary(detail: dict[str, Any]) -> str:
+    """把探测结果压成一行日志，例如“3/3 项探测通过，最慢 0.12 秒”。"""
+    if not detail:
+        return ""
+    summary = (
+        f"{detail['passed']}/{detail['total']} 项探测通过，"
+        f"最慢 {detail['slowest']:.2f} 秒"
+    )
+    if detail["failures"]:
+        summary += "；失败：" + "，".join(detail["failures"])
+    return summary
+
+
+def internet_available(
+    config: dict[str, Any], fast: bool = False, detail: dict[str, Any] | None = None
+) -> bool:
     # 认证门户也可能返回 HTTP 200；因此必须同时核对预期的状态码或正文，不能只看请求是否成功。
+    # 探测同时覆盖 HTTP 和 HTTPS：只验证 80 端口无法发现 TLS、443 或本机代理/ DNS 故障，
+    # 会出现“网页打不开但日志一直显示网络正常”的假象。标了 critical 的探测必须通过。
     network_check = config["network_check"]
     probes = network_check["probes"][:1] if fast else network_check["probes"]
     timeout_seconds = int(network_check.get("retry_timeout_seconds", 2)) if fast else int(network_check["timeout_seconds"])
+    passed = 0
+    slowest = 0.0
+    failures: list[str] = []
+    critical_failed = False
+    attempted = 0
     for probe in probes:
-        try:
-            with urlopen(Request(probe["url"], headers={"User-Agent": "CampusNet/1.0"}), timeout=timeout_seconds) as response:
-                expected_status = probe.get("expected_status")
-                expected_text = probe.get("expected_text")
-                if expected_status is not None and response.status != expected_status:
-                    continue
-                if expected_text is not None and expected_text not in response.read().decode("utf-8", errors="replace"):
-                    continue
-                if expected_status is not None or expected_text is not None:
-                    return True
-        except (URLError, OSError, TimeoutError):
-            pass
-    return False
+        attempted += 1
+        ok, elapsed, reason = _probe_once(probe, timeout_seconds)
+        slowest = max(slowest, elapsed)
+        if ok:
+            passed += 1
+        else:
+            failures.append(f"{probe_label(str(probe['url']))}：{reason}")
+            if probe.get("critical"):
+                critical_failed = True
+                # 关键探测已经失败，网络必定异常；不必再等其余探测各自超时。
+                break
+    # 未标记 critical 的旧配置保持“任一探测通过即可”的行为，避免升级后误判。
+    ok = passed > 0 and not critical_failed
+    slow_probe_seconds = float(network_check.get("slow_probe_seconds", 3))
+    if detail is not None:
+        detail.update(
+            ok=ok,
+            passed=passed,
+            total=attempted,
+            slowest=slowest,
+            failures=tuple(failures),
+            slow=ok and slowest > slow_probe_seconds,
+        )
+    return ok
 
 
 def ensure_connected(
@@ -706,11 +772,25 @@ def ensure_connected(
         if status is None:
             return ConnectionAttempt(False)
 
-    if internet_available(config, fast=fast_network_check):
-        LOG.info("网络正常。")
+    probe_detail: dict[str, Any] = {}
+    if internet_available(config, fast=fast_network_check, detail=probe_detail):
+        summary = probe_detail_summary(probe_detail)
+        if probe_detail.get("slow"):
+            LOG.warning(
+                "网络可用但探测响应缓慢（%s）。若网页仍打不开，请检查本机代理、VPN 或 DNS，"
+                "这不一定是校园网认证问题。",
+                summary,
+            )
+        elif summary:
+            LOG.info("网络正常（%s）。", summary)
+        else:
+            LOG.info("网络正常。")
         return ConnectionAttempt(True)
 
     # 已连接时只访问校园网内网门户；因此外网断开也可完成认证。
+    summary = probe_detail_summary(probe_detail)
+    if summary:
+        LOG.warning("探测详情：%s。", summary)
     if fast_network_check:
         LOG.warning("网络仍不可用，正在快速重试校园网认证。")
     else:

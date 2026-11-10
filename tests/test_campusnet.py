@@ -13,6 +13,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import campusnet
 
 
+class _FakeResponse:
+    def __init__(self, status: int, body: str = "") -> None:
+        self.status = status
+        self._body = body.encode("utf-8")
+
+    def read(self) -> bytes:
+        return self._body
+
+    def __enter__(self) -> "_FakeResponse":
+        return self
+
+    def __exit__(self, *exc_info: object) -> bool:
+        return False
+
+
 class SRunEncodingTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls) -> None:
@@ -61,6 +76,68 @@ class SRunEncodingTests(unittest.TestCase):
             self.assertFalse(campusnet.internet_available(config, fast=True))
         self.assertEqual(urlopen.call_count, 1)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 2)
+
+    def test_critical_https_probe_failure_is_not_masked_by_http_success(self) -> None:
+        # 本机代理或 DNS 故障时 80 端口可能仍然可用。HTTPS 探测失败必须判定为异常，
+        # 否则网页打不开而日志一直显示“网络正常”。
+        config = {
+            "network_check": {
+                "probes": [
+                    {"url": "https://critical.example/", "expected_status": 200, "critical": True},
+                    {"url": "http://optional.example/", "expected_status": 204},
+                ],
+                "timeout_seconds": 8,
+                "retry_timeout_seconds": 2,
+            }
+        }
+
+        def fake_urlopen(request, timeout):
+            if request.full_url.startswith("https://"):
+                raise URLError("TLS handshake failed")
+            return _FakeResponse(204)
+
+        detail = {}
+        with patch("campusnet.urlopen", side_effect=fake_urlopen) as urlopen:
+            self.assertFalse(campusnet.internet_available(config, detail=detail))
+        # 关键探测失败后应立即返回，不再等待其余探测超时。
+        self.assertEqual(urlopen.call_count, 1)
+        self.assertEqual(detail["passed"], 0)
+        self.assertTrue(any("critical.example" in item for item in detail["failures"]))
+
+    def test_all_probes_passing_reports_count_and_slowest_time(self) -> None:
+        config = {
+            "network_check": {
+                "probes": [
+                    {"url": "https://www.baidu.com/", "expected_status": 200, "critical": True},
+                    {"url": "http://connectivitycheck.gstatic.com/generate_204", "expected_status": 204},
+                ],
+                "timeout_seconds": 8,
+            }
+        }
+        detail = {}
+        # 两个探测点期望值不同，按 URL 返回对应状态码。
+        with patch(
+            "campusnet.urlopen",
+            side_effect=lambda request, timeout: _FakeResponse(
+                200 if "baidu" in request.full_url else 204
+            ),
+        ):
+            self.assertTrue(campusnet.internet_available(config, detail=detail))
+        self.assertEqual((detail["passed"], detail["total"]), (2, 2))
+        self.assertIn("2/2 项探测通过", campusnet.probe_detail_summary(detail))
+
+    def test_slow_but_successful_probe_is_flagged(self) -> None:
+        config = {
+            "network_check": {
+                "probes": [{"url": "https://www.baidu.com/", "expected_status": 200, "critical": True}],
+                "timeout_seconds": 8,
+                "slow_probe_seconds": 3,
+            }
+        }
+        detail = {}
+        with patch("campusnet._probe_once", return_value=(True, 5.0, "")):
+            self.assertTrue(campusnet.internet_available(config, detail=detail))
+        self.assertTrue(detail["slow"])
 
     def test_wifi_choice_persists_without_changing_config(self) -> None:
         config = {"wifi": {"ssid": "BIT-Web"}}

@@ -191,10 +191,15 @@ Get-Content G:\D_Lizhuoran\Code\CampusNet\campusnet.log -Encoding UTF8 -Wait
             └─ 等待 3 秒，再次检测外网是否恢复；失败则 10 秒后重试
 ```
 
-“断网”的判断不是只看 Wi‑Fi 是否连接，而是访问两个联网检测地址：
+“断网”的判断不是只看 Wi‑Fi 是否连接，而是逐个访问三个联网检测地址：
 
+- `https://www.baidu.com/`，必须返回 HTTP 200。这一项标记为 `critical`，用真实 HTTPS（TLS/443）验证网页能否打开。
 - Microsoft 的 `connecttest.txt`，必须返回预期文字。
 - Google 的 `generate_204`，必须返回 HTTP 204。
+
+标记了 `critical` 的探测必须通过，只靠 HTTP 80 可达不再算网络正常。这样可以发现“80 端口通、但 TLS/443 或本机代理、VPN、DNS 有故障”的情况——浏览器打不开网页，而旧版探测仍然报告正常。未标记 `critical` 的探测只要有一项通过即可，避免单个公共探测点在部分地区不可用时误判断网，从而反复重新认证。旧配置没有 `critical` 字段时保持原来的“任一通过即可”行为。
+
+每次检测还会把通过数量和最慢耗时写进日志，例如 `网络正常（3/3 项探测通过，最慢 0.12 秒）`。如果全部通过但最慢耗时超过 `network_check.slow_probe_seconds`（默认 3 秒），日志会改写为警告，提示检查本机代理、VPN 或 DNS，而不是继续显示“正常”。
 
 因此即使电脑还连着所选校园网、但校园网认证已经过期或网络无外网，程序也会识别为异常并重新登录。
 
@@ -215,6 +220,6 @@ netsh wlan connect name=BIT-Web
 - `wifi_reconnect_cooldown_seconds` / `max_wifi_reconnect_cooldown_seconds`：物理恢复的初始与最大退避时间，默认 30 / 300 秒。
 - `dhcp_renew_after_wifi_recoveries`：第几次物理恢复起续租 DHCP，默认 2。
 
-首次发现断网时，程序仍使用两个外网探测地址确认；后续恢复重试改用一个最多 2 秒的快速探测，然后直接认证，避免每轮都等待两个外网请求超时。`network_check.retry_timeout_seconds` 可调整这个快速探测的超时，默认 2 秒。
+首次发现断网时，程序仍使用多个外网探测地址确认；后续恢复重试改用列表中的第一个探测（HTTPS）和最多 2 秒的快速超时，然后直接认证，避免每轮都等待多个外网请求超时。`network_check.retry_timeout_seconds` 可调整这个快速探测的超时，默认 2 秒；`network_check.slow_probe_seconds` 可调整“探测缓慢”的告警阈值，默认 3 秒。
 
 若电脑未连接任何 Wi-Fi，程序会跳过外网探测，立即执行本地 `netsh` 命令连接已选择的校园网。若正连接其他且能正常联网的非校园 Wi-Fi，则不会抢占该连接；在 `BIT-Web` 和 `BIT-Mobile` 之间则始终以保存的选择为准。

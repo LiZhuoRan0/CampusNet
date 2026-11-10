@@ -21,6 +21,11 @@
   "network_check": {
     "probes": [
       {
+        "url": "https://www.baidu.com/",
+        "expected_status": 200,
+        "critical": true
+      },
+      {
         "url": "http://www.msftconnecttest.com/connecttest.txt",
         "expected_text": "Microsoft Connect Test"
       },
@@ -30,7 +35,8 @@
       }
     ],
     "timeout_seconds": 8,
-    "retry_timeout_seconds": 2
+    "retry_timeout_seconds": 2,
+    "slow_probe_seconds": 3
   },
   "check_interval_seconds": 30,
   "retry_interval_seconds": 10
